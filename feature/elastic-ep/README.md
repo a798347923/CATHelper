@@ -56,10 +56,10 @@ VLLM_TARGET_DEVICE=empty pip install -e .
 
 cd /vllm-workspace/vllm-ascend
 git submodule update --init --recursive
-# 已知issue：triton-ascend 3.2.1 仅适用于 vllm-ascend v0.20.0+，当前使用v0.18.0版本，triton-ascend需要降级到 3.2.0，否则安装会报错。
-# 参考：https://github.com/vllm-project/vllm-ascend/issues/9794
-sed -i 's/triton-ascend==3.2.1/triton-ascend==3.2.0/' pyproject.toml
-pip install -e .
+pip uninstall triton-ascend
+pip uninstall triton
+pip install triton-ascend==3.2.1 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi
+pip install --no-build-isolation -e . --no-cache-dir
 ```
 
 ### 使用
