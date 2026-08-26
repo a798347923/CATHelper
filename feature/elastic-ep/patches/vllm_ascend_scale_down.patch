@@ -3121,7 +3121,6 @@ diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
 +            self.model_loaded = False
 +            self._ep_size_for_elastic = ep_size
 +            self._num_redundant_experts_for_elastic = num_redundant_experts
-+            init_elastic_info(ep_size, self.num_logical_expert + num_redundant_experts)
  
      def uninstall_static_kernel(self):
          import fcntl
