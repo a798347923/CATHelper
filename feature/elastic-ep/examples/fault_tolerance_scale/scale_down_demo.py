@@ -214,7 +214,14 @@ def main():
         type=int,
         default=None,
         help="vLLM data-parallel size (number of DP ranks; must be <= "
-             "len(visible-devices)). Default: len(visible-devices)",
+             "len(visible-devices) / tp-size). Default: len(visible-devices)",
+    )
+    parser.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="vLLM tensor-parallel size (default: 1). Each DP rank occupies "
+             "tp-size consecutive physical cards",
     )
     # CATMonitor subscription (Path 1) arguments.
     parser.add_argument(
@@ -267,27 +274,30 @@ def main():
     )
     args = parser.parse_args()
 
-    dp_size = args.dp_size if args.dp_size is not None else len(args.visible_devices)
-    if dp_size < 1 or dp_size > len(args.visible_devices):
+    dp_size = args.dp_size if args.dp_size is not None else len(args.visible_devices) // args.tp_size
+    total_cards = dp_size * args.tp_size
+    if dp_size < 1 or total_cards > len(args.visible_devices):
         parser.error(
-            f"--dp-size {dp_size} out of range "
-            f"(visible devices: {len(args.visible_devices)})"
+            f"--dp-size {dp_size} * --tp-size {args.tp_size} = {total_cards} "
+            f"exceeds visible devices ({len(args.visible_devices)})"
         )
 
     # CATMonitor reports faults per DIE (npu_id = DIE id, e.g. 0-7 on A3);
     # vLLM ranks are per physical card. Map each DIE to the DP ranks of the
     # physical cards it hosts so scale_down excludes the right ranks.
+    # With TP>1, each DP rank occupies tp_size consecutive physical cards.
     npu_ids = args.npu_ids
     if npu_ids is None:
         npu_ids = sorted(
-            {p // args.npu_per_die for p in args.visible_devices[:dp_size]}
+            {p // args.npu_per_die for p in args.visible_devices[:total_cards]}
         )
     npu_to_dp = build_npu_to_dp_ranks(
-        npu_ids, args.npu_per_die, args.visible_devices, dp_size
+        npu_ids, args.npu_per_die, args.visible_devices, dp_size, args.tp_size
     )
     print(
         f"NPU->DP mapping: {npu_to_dp} "
         f"({len(npu_ids)} DIE subscribed, dp-size={dp_size}, "
+        f"tp-size={args.tp_size}, "
         f"visible-devices={args.visible_devices}, "
         f"fault types={args.fault_types}, "
         f"ignore-error-codes={args.ignore_error_codes})"
@@ -316,6 +326,7 @@ def main():
         dp_size=dp_size,
         npu_per_die=args.npu_per_die,
         npu_ids=list(npu_ids),
+        tp_size=args.tp_size,
     )
     subscriber.start(block=False)
 

@@ -126,19 +126,22 @@ class CatMonitorFaultSubscriber:
         dp_size: Optional[int] = None,
         npu_per_die: Optional[int] = None,
         npu_ids: Optional[List[int]] = None,
+        tp_size: int = 1,
     ):
         self.cfg = cfg
         self.npu_to_dp = dict(npu_to_dp)
+        self._tp_size = tp_size
         self._dynamic = all(
             x is not None for x in (visible_devices, dp_size, npu_per_die)
         )
         # Deployed physical cards in current DP-rank order (option A state).
+        # With TP>1, each DP rank occupies tp_size consecutive cards.
         self._deployed: Optional[List[int]] = (
-            list(visible_devices[:dp_size]) if self._dynamic else None
+            list(visible_devices[:dp_size * tp_size]) if self._dynamic else None
         )
         self._npu_per_die = npu_per_die if self._dynamic else None
         self._npu_ids = sorted(npu_ids) if npu_ids is not None else sorted(npu_to_dp)
-        self.dp_size = len(self._deployed) if self._dynamic else dp_size
+        self.dp_size = dp_size if self._dynamic else dp_size
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._subscription_id: Optional[str] = None
@@ -197,11 +200,19 @@ class CatMonitorFaultSubscriber:
         vLLM renumbers the surviving engines to contiguous ranks 0..N-1 in
         their original order after a successful scale_down, so the surviving
         deployed cards (in order) become the new rank order.
+
+        With TP>1, each DP rank occupies ``_tp_size`` consecutive cards in
+        ``_deployed``; groups of ``_tp_size`` cards form one DP rank.
         """
-        ranks_by_die: Dict[int, List[int]] = {}
-        for rank, phys in enumerate(self._deployed):
-            ranks_by_die.setdefault(phys // self._npu_per_die, []).append(rank)
-        self.dp_size = len(self._deployed)
+        ranks_by_die: Dict[int, set] = {}
+        num_dp = len(self._deployed) // self._tp_size
+        for dp_rank in range(num_dp):
+            start = dp_rank * self._tp_size
+            end = start + self._tp_size
+            for phys in self._deployed[start:end]:
+                die = phys // self._npu_per_die
+                ranks_by_die.setdefault(die, set()).add(dp_rank)
+        self.dp_size = num_dp
         wanted = set(self._npu_ids)
         return {
             d: sorted(ranks)
@@ -213,17 +224,39 @@ class CatMonitorFaultSubscriber:
         """Drop the scaled-down DIE's physical cards from the deployment and
         rebuild the NPU->DP map after a successful vLLM scale_down.
 
-        Dies whose cards are all removed leave the map; later CATMonitor events
-        for them map to no ranks and are skipped (no more scale_down / retry).
+        With TP>1, a DIE fault may only affect part of a DP rank's cards; the
+        entire DP rank (all ``tp_size`` cards) must be removed because vLLM
+        cannot function with missing TP ranks.  Dies whose cards are all
+        removed leave the map; later CATMonitor events for them map to no
+        ranks and are skipped (no more scale_down / retry).
         """
         if not self._dynamic:
             return
         with self._lock:
             die = int(npu_id)
-            removed = [p for p in self._deployed if p // self._npu_per_die == die]
-            self._deployed = [
-                p for p in self._deployed if p // self._npu_per_die != die
-            ]
+            num_dp = len(self._deployed) // self._tp_size
+            # Find DP ranks that overlap with the faulted DIE.
+            affected: set = set()
+            for dp_rank in range(num_dp):
+                start = dp_rank * self._tp_size
+                end = start + self._tp_size
+                for phys in self._deployed[start:end]:
+                    if phys // self._npu_per_die == die:
+                        affected.add(dp_rank)
+                        break
+            # Remove ALL cards of affected DP ranks (not just the faulted
+            # DIE's cards) so remaining cards stay in tp_size-sized groups.
+            new_deployed: list = []
+            removed: list = []
+            for dp_rank in range(num_dp):
+                start = dp_rank * self._tp_size
+                end = start + self._tp_size
+                cards = self._deployed[start:end]
+                if dp_rank in affected:
+                    removed.extend(cards)
+                else:
+                    new_deployed.extend(cards)
+            self._deployed = new_deployed
             self.npu_to_dp = self._rebuild_npu_to_dp()
             self._active_faults.pop(npu_id, None)
             print(
@@ -536,28 +569,35 @@ def build_npu_to_dp_ranks(
     npu_per_die: int,
     visible_devices: List[int],
     dp_size: int,
+    tp_size: int = 1,
 ) -> Dict[int, List[int]]:
     """Map each CATMonitor ``npu_id`` (a DIE on A3) to the vLLM DP ranks of
     the physical NPU cards it hosts.
 
     A3 topology: one DIE = ``npu_per_die`` physical cards; physical card ``p``
     belongs to DIE ``p // npu_per_die`` (so DIE 5 hosts cards 10 and 11 when
-    ``npu_per_die=2``). vLLM DP rank ``r`` binds ``visible_devices[r]``, so a
-    fault on DIE ``d`` must exclude every rank whose physical card falls in
-    ``[d*npu_per_die, d*npu_per_die + npu_per_die)``. Dies that have no card
-    inside ``visible_devices[:dp_size]`` (not part of the deployment) map to no
-    ranks and their events are skipped.
+    ``npu_per_die=2``). vLLM DP rank ``r`` binds ``tp_size`` consecutive
+    physical cards starting at ``visible_devices[r * tp_size]``, so a fault on
+    DIE ``d`` must exclude every DP rank whose cards overlap with that DIE.
+    Dies that have no card inside the deployment map to no ranks and their
+    events are skipped.
 
     ``npu_ids`` is the subscription scope (DIE ids reported by CATMonitor);
-    ``visible_devices`` is ASCEND_RT_VISIBLE_DEVICES in DP-rank order.
+    ``visible_devices`` is ASCEND_RT_VISIBLE_DEVICES in DP-rank order;
+    ``tp_size`` is the tensor-parallel size (default 1).
     """
-    if dp_size < 1 or dp_size > len(visible_devices):
+    total_cards = dp_size * tp_size
+    if dp_size < 1 or total_cards > len(visible_devices):
         raise ValueError(
-            f"dp_size={dp_size} out of range "
-            f"(visible devices: {len(visible_devices)})"
+            f"dp_size={dp_size} * tp_size={tp_size} = {total_cards} exceeds "
+            f"visible devices ({len(visible_devices)})"
         )
-    ranks_by_die: Dict[int, List[int]] = {}
-    for rank, phys in enumerate(visible_devices[:dp_size]):
-        ranks_by_die.setdefault(phys // npu_per_die, []).append(rank)
+    ranks_by_die: Dict[int, set] = {}
+    for dp_rank in range(dp_size):
+        start = dp_rank * tp_size
+        end = start + tp_size
+        for phys in visible_devices[start:end]:
+            die = phys // npu_per_die
+            ranks_by_die.setdefault(die, set()).add(dp_rank)
     wanted = set(npu_ids)
     return {d: sorted(ranks) for d, ranks in ranks_by_die.items() if d in wanted}

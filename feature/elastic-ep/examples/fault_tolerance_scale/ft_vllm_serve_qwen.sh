@@ -6,6 +6,7 @@ set -e
 HOST="0.0.0.0"
 PORT=8006
 DATA_PARALLEL_SIZE=4
+TENSOR_PARALLEL_SIZE=1
 REDUNDANT_EXPERTS=0
 FAULT_PORT=22867
 LOCAL_MODEL_PATH="nytopop/Qwen3-30B-A3B.w8a8"
@@ -17,6 +18,10 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --dp-size)
             DATA_PARALLEL_SIZE="$2"
+            shift 2
+            ;;
+        --tp-size)
+            TENSOR_PARALLEL_SIZE="$2"
             shift 2
             ;;
         --redundant-experts)
@@ -55,6 +60,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo "Options:"
             echo "  --dp-size SIZE                 Set data parallel size, i.e. number of DP ranks to launch (default: 4)"
+            echo "  --tp-size SIZE                 Set tensor parallel size (default: 1)"
             echo "  --redundant-experts SIZE       Set number of redundant experts per rank for scale-down redistribution (default: 0)"
             echo "  --host HOST                    Set host address (default: 0.0.0.0)"
             echo "  --port PORT                    Set port number (default: 8006)"
@@ -74,7 +80,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "Starting vLLM server for $MODEL_NAME with data parallel size: $DATA_PARALLEL_SIZE and redundant experts: $REDUNDANT_EXPERTS"
+echo "Starting vLLM server for $MODEL_NAME with data parallel size: $DATA_PARALLEL_SIZE, tensor parallel size: $TENSOR_PARALLEL_SIZE, and redundant experts: $REDUNDANT_EXPERTS"
 
 export HCCL_BUFFSIZE=2048
 
@@ -86,6 +92,7 @@ vllm serve "$LOCAL_MODEL_PATH" \
     --served-model-name "$MODEL_NAME" \
     --data-parallel-size "$DATA_PARALLEL_SIZE" \
     --data-parallel-size-local "$DATA_PARALLEL_SIZE" \
+    --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
     --enable-expert-parallel \
     --enable-fault-tolerance \
     --fault-tolerance-config '{"external_fault_notify_port":'$FAULT_PORT',"engine_recovery_timeout_sec":'$RECOVERY_TIMEOUT'}' \

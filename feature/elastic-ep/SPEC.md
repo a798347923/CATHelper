@@ -137,6 +137,7 @@ pytest tests/v1/fault_tolerance/
 | 参数 | 默认值 | 描述 |
 |------|--------|------|
 | `--dp-size` | `4` | 数据并行大小，即启动的 DP rank 数量 |
+| `--tp-size` | `1` | 张量并行大小，每个 DP rank 占用 tp-size 张物理卡 |
 | `--redundant-experts` | `0` | 每个 rank 的冗余专家数量，缩容时有限制：全部健康卡上的冗余专家的总数必须大于故障卡上的逻辑专家数量 |
 | `--host` | `0.0.0.0` | 服务器主机地址 |
 | `--port` | `8006` | 服务器端口 |
@@ -152,8 +153,9 @@ pytest tests/v1/fault_tolerance/
 |------|--------|------|
 | `--npu-ids` | 自动推导 | CATMonitor/DIE 设备 ID（A3 为 `0-7`，8 个 DIE），订阅这些 DIE 的故障事件；缺省时由 `--visible-devices` 与 `--npu-per-die` 推导。**注意：这是 DIE 编号，不是物理卡编号** |
 | `--npu-per-die` | `2` | 每个 DIE 承载的物理卡数（A3=2，DIE `d` 承载物理卡 `d*npu-per-die` ~ `d*npu-per-die+npu-per-die-1`，如 DIE 5 = 卡 10,11） |
-| `--visible-devices` | `0-15` | vLLM 可见的物理卡 ID（对应 `ASCEND_RT_VISIBLE_DEVICES`，按 DP rank 顺序）；DP rank `r` 绑定 `visible_devices[r]` |
-| `--dp-size` | `len(--visible-devices)` | vLLM 数据并行大小（DP rank 数量），须 ≤ 可见卡数；默认用全部可见卡 |
+| `--visible-devices` | `0-15` | vLLM 可见的物理卡 ID（对应 `ASCEND_RT_VISIBLE_DEVICES`，按 DP rank 顺序）；DP rank `r` 绑定 `visible_devices[r*tp_size:(r+1)*tp_size]` |
+| `--dp-size` | `len(--visible-devices) / tp-size` | vLLM 数据并行大小（DP rank 数量），须 ≤ 可见卡数 / tp-size；默认用全部可见卡 |
+| `--tp-size` | `1` | 张量并行大小，每个 DP rank 占用 tp-size 张物理卡 |
 | `--external-fault-notify-port` | `22867` | 订阅引擎健康状态的 ZMQ SUB 端口（需与 vLLM 的 `--fault-port` 一致） |
 | `--port` | `8006` | vLLM API 端口，用于发送暂停/缩容指令 |
 | `--host` | `localhost` | vLLM API 主机地址 |
@@ -258,7 +260,7 @@ pytest tests/v1/fault_tolerance/
 | NPU 支持 | 仅支持华为昇腾 A3 服务器 |
 | Expert Parallel | 必须开启专家并行 |
 | Pipeline Parallel | 不支持 |
-| Tensor Parallel | 仅支持 TP=1 |
+| Tensor Parallel | 已支持 | 支持 TP>=1，TP>1 时每个 DP rank 占用 tp_size 张物理卡 |
 | 动态 EPLB | 已兼容，支持故障后通过 EPLB 框架重新平衡专家放置 |
 | 量化模型 | 仅兼容 W8A8（ModelSlim 格式），W4A8、W4A16 等暂不支持 |
 | FULL Graph 模式 | 暂未兼容，不支持大模型整图捕获 |
