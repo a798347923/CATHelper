@@ -1,4 +1,5 @@
 Subject: [PATCH] [Feature][FaultTolerance] support MoE scale-down with Qwen3.5
+[Feature][FaultTolerance] support MoE scale-down with Qwen3.5
 skip prepare_input_event synchronize/record after a fault has been detected (#90)
 [Bugfix] Set the gloo timeout after pg initialization in retry. (#83)
 avoid using npu-smi in check_health when fault tolerance is enabled (#82)
@@ -628,7 +629,7 @@ Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 ===================================================================
 diff --git a/vllm_ascend/eplb/adaptor/vllm_adaptor.py b/vllm_ascend/eplb/adaptor/vllm_adaptor.py
 --- a/vllm_ascend/eplb/adaptor/vllm_adaptor.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
-+++ b/vllm_ascend/eplb/adaptor/vllm_adaptor.py	(revision 14e8fdda18933dc82185a7ed60d62ac62c7fd0a4)
++++ b/vllm_ascend/eplb/adaptor/vllm_adaptor.py	(revision bd7d073f9bdc1bf839c5825e71e0b02de938c68b)
 @@ -27,17 +27,28 @@
  
  
@@ -818,7 +819,7 @@ Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 ===================================================================
 diff --git a/vllm_ascend/eplb/core/eplb_worker.py b/vllm_ascend/eplb/core/eplb_worker.py
 --- a/vllm_ascend/eplb/core/eplb_worker.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
-+++ b/vllm_ascend/eplb/core/eplb_worker.py	(revision 14e8fdda18933dc82185a7ed60d62ac62c7fd0a4)
++++ b/vllm_ascend/eplb/core/eplb_worker.py	(revision bd7d073f9bdc1bf839c5825e71e0b02de938c68b)
 @@ -36,6 +36,11 @@
          self.rank_id = dist.get_rank()
          self.multi_stage = policy_type == 3
@@ -1753,7 +1754,7 @@ Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 ===================================================================
 diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
 --- a/vllm_ascend/worker/model_runner_v1.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
-+++ b/vllm_ascend/worker/model_runner_v1.py	(revision 14e8fdda18933dc82185a7ed60d62ac62c7fd0a4)
++++ b/vllm_ascend/worker/model_runner_v1.py	(revision bd7d073f9bdc1bf839c5825e71e0b02de938c68b)
 @@ -142,6 +142,8 @@
  )
  from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
@@ -1873,8 +1874,8 @@ Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 ===================================================================
 diff --git a/vllm_ascend/worker/sentinel/npu_worker_sentinel.py b/vllm_ascend/worker/sentinel/npu_worker_sentinel.py
 new file mode 100644
---- /dev/null	(revision 14e8fdda18933dc82185a7ed60d62ac62c7fd0a4)
-+++ b/vllm_ascend/worker/sentinel/npu_worker_sentinel.py	(revision 14e8fdda18933dc82185a7ed60d62ac62c7fd0a4)
+--- /dev/null	(revision bd7d073f9bdc1bf839c5825e71e0b02de938c68b)
++++ b/vllm_ascend/worker/sentinel/npu_worker_sentinel.py	(revision bd7d073f9bdc1bf839c5825e71e0b02de938c68b)
 @@ -0,0 +1,258 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
@@ -2141,8 +2142,8 @@ Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 ===================================================================
 diff --git a/vllm_ascend/worker/sentinel/scale_down.py b/vllm_ascend/worker/sentinel/scale_down.py
 new file mode 100644
---- /dev/null	(revision 14e8fdda18933dc82185a7ed60d62ac62c7fd0a4)
-+++ b/vllm_ascend/worker/sentinel/scale_down.py	(revision 14e8fdda18933dc82185a7ed60d62ac62c7fd0a4)
+--- /dev/null	(revision bd7d073f9bdc1bf839c5825e71e0b02de938c68b)
++++ b/vllm_ascend/worker/sentinel/scale_down.py	(revision bd7d073f9bdc1bf839c5825e71e0b02de938c68b)
 @@ -0,0 +1,874 @@
 +import contextlib
 +import socket
@@ -3025,7 +3026,7 @@ Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 ===================================================================
 diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
 --- a/vllm_ascend/worker/worker.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
-+++ b/vllm_ascend/worker/worker.py	(revision 14e8fdda18933dc82185a7ed60d62ac62c7fd0a4)
++++ b/vllm_ascend/worker/worker.py	(revision bd7d073f9bdc1bf839c5825e71e0b02de938c68b)
 @@ -19,6 +19,7 @@
  
  import copy
@@ -3086,7 +3087,7 @@ diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
          self.use_v2_model_runner = envs_vllm.VLLM_USE_V2_MODEL_RUNNER
          self._pp_send_work: list[Handle] = []
  
-@@ -154,6 +175,38 @@
+@@ -154,6 +175,37 @@
  
              signal.signal(signal.SIGTERM, signal_handler)
              signal.signal(signal.SIGINT, signal_handler)
@@ -3124,7 +3125,7 @@ diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
  
      def uninstall_static_kernel(self):
          import fcntl
-@@ -246,6 +299,16 @@
+@@ -246,6 +298,16 @@
          self.cache_config.num_gpu_blocks = num_gpu_blocks
          self.cache_config.num_cpu_blocks = num_cpu_blocks
  
@@ -3141,7 +3142,7 @@ diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
      def _init_device(self):
          device = torch.device(f"npu:{self.local_rank}")
          torch.npu.set_device(device)
-@@ -322,6 +385,10 @@
+@@ -322,6 +384,10 @@
              self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
          else:
              self.model_runner = NPUModelRunner(self.vllm_config, self.device)
@@ -3152,7 +3153,7 @@ diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
  
      @torch.inference_mode()
      def determine_available_memory(self) -> int:
-@@ -360,6 +427,7 @@
+@@ -360,6 +426,7 @@
  
          return int(self.available_kv_cache_memory_bytes)
  
@@ -3160,7 +3161,7 @@ diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
      def execute_model(
          self,
          scheduler_output: "SchedulerOutput",
-@@ -436,8 +504,18 @@
+@@ -436,8 +503,18 @@
  
              context = nullcontext()  # type: ignore
  
@@ -3180,7 +3181,7 @@ diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
  
      def compile_or_warm_up_model(self) -> float:
          # Note: need to adapt for graph mode.
-@@ -569,6 +647,7 @@
+@@ -569,6 +646,7 @@
      def reset_encoder_cache(self) -> None:
          self.model_runner.reset_encoder_cache()
  
@@ -3188,7 +3189,7 @@ diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
      def execute_dummy_batch(self) -> None:
          self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=True)
  
-@@ -639,6 +718,10 @@
+@@ -639,6 +717,10 @@
      def check_health(self) -> None:
          import subprocess
  
@@ -3322,7 +3323,7 @@ Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 ===================================================================
 diff --git a/vllm_ascend/eplb/utils.py b/vllm_ascend/eplb/utils.py
 --- a/vllm_ascend/eplb/utils.py	(revision 3cf5b46679753cdef9fbe7b039269a88d05e3b35)
-+++ b/vllm_ascend/eplb/utils.py	(revision 14e8fdda18933dc82185a7ed60d62ac62c7fd0a4)
++++ b/vllm_ascend/eplb/utils.py	(revision bd7d073f9bdc1bf839c5825e71e0b02de938c68b)
 @@ -19,30 +19,41 @@
  
  import torch
@@ -3373,5 +3374,64 @@ diff --git a/vllm_ascend/eplb/utils.py b/vllm_ascend/eplb/utils.py
  
  
  def model_register(model):
+Index: vllm_ascend/spec_decode/eagle_proposer.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/spec_decode/eagle_proposer.py b/vllm_ascend/spec_decode/eagle_proposer.py
+--- a/vllm_ascend/spec_decode/eagle_proposer.py	(revision bd7d073f9bdc1bf839c5825e71e0b02de938c68b)
++++ b/vllm_ascend/spec_decode/eagle_proposer.py	(revision 114001b648429829d769986e786dae45af512ded)
+@@ -243,6 +243,13 @@
+                 else self.model.mask_hidden.view(self.hidden_size)
+             )
+ 
++    def _get_draft_base_model(self) -> nn.Module:
++        """Get the base model from draft model"""
++        if hasattr(self.model, "language_model"):
++            return self.model.language_model
++        else:
++            return self.model
++
+     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
+         """
+         Some draft models may not have their own embedding layers, and some may
+@@ -271,12 +278,12 @@
+                     )
+                 elif (
+                     isinstance(target_embed_tokens.weight, torch.Tensor)
+-                    and isinstance(self.model.model.embed_tokens.weight, torch.Tensor)
++                    and isinstance(self._get_draft_base_model().model.embed_tokens.weight, torch.Tensor)
+                     # TODO: Offload to CPU for comparison to avoid extra NPU memory
+                     # usage in CI testing environments with limited NPU memory
+                     and torch.equal(
+                         target_embed_tokens.weight.cpu(),
+-                        self.model.model.embed_tokens.weight.cpu(),
++                        self._get_draft_base_model().model.embed_tokens.weight.cpu(),
+                     )
+                 ):
+                     share_embeddings = True
+@@ -296,9 +303,9 @@
+                 logger.info("Detected MTP model. Sharing target model embedding weights with the draft model.")
+ 
+             if share_embeddings:
+-                if hasattr(self.model.model, "embed_tokens"):
+-                    del self.model.model.embed_tokens
+-                self.model.model.embed_tokens = target_embed_tokens
++                if hasattr(self._get_draft_base_model().model, "embed_tokens"):
++                    del self._get_draft_base_model().model.embed_tokens
++                self._get_draft_base_model().model.embed_tokens = target_embed_tokens
+         else:
+             logger.info(
+                 "Since PP > 1 or other reasons the model head loaded its own vocab embedding"
+@@ -317,7 +324,7 @@
+                 self.model.lm_head = model.lm_head
+ 
+         if self.method == "mtp" and self.vllm_config.model_config.is_deepseek_mla:
+-            for _, layer_module in self.model.model.layers.items():
++            for _, layer_module in self._get_draft_base_model().model.layers.items():
+                 if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
+                     layer_module.shared_head.head = model.lm_head
+ 
 diff --git a/vllm_ascend/worker/sentinel/__init__.py b/vllm_ascend/worker/sentinel/__init__.py
 new file mode 100644
