@@ -272,7 +272,7 @@ elastic-ep/vllm/
 | 项目 | 说明 |
 |------|------|
 | 路径 | `examples/fault_tolerance_scale/ft_vllm_serve_qwen.sh` |
-| 功能 | 启动带容错功能的 vLLM 服务 |
+| 功能 | 启动带容错功能的 vLLM 服务；支持单节点与多节点（主/从）拉起：多节点时脚本根据 `--num-nodes` 均分本地 DP 数（`--data-parallel-size-local`），自动附加 `--data-parallel-address`/`--data-parallel-rpc-port`，从节点追加 `--headless`/`--data-parallel-start-rank`（不提供 API server，缩容指令统一发往主节点） |
 
 ---
 

@@ -127,10 +127,12 @@ class CatMonitorFaultSubscriber:
         npu_per_die: Optional[int] = None,
         npu_ids: Optional[List[int]] = None,
         tp_size: int = 1,
+        dp_rank_offset: int = 0,
     ):
         self.cfg = cfg
         self.npu_to_dp = dict(npu_to_dp)
         self._tp_size = tp_size
+        self._dp_rank_offset = dp_rank_offset
         self._dynamic = all(
             x is not None for x in (visible_devices, dp_size, npu_per_die)
         )
@@ -153,6 +155,10 @@ class CatMonitorFaultSubscriber:
         # together used to start a second, duplicate scale_down for the same
         # (possibly already removed) ranks. This set serializes per NPU.
         self._handling: set = set()
+        # Status polling for DP rank renumbering detection.
+        self._last_engine_count: Optional[int] = None
+        self._poll_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
 
     # ---- vLLM control ----
 
@@ -203,15 +209,19 @@ class CatMonitorFaultSubscriber:
 
         With TP>1, each DP rank occupies ``_tp_size`` consecutive cards in
         ``_deployed``; groups of ``_tp_size`` cards form one DP rank.
+
+        In multi-node mode, ``_dp_rank_offset`` shifts local DP ranks to
+        global numbering.
         """
         ranks_by_die: Dict[int, set] = {}
         num_dp = len(self._deployed) // self._tp_size
-        for dp_rank in range(num_dp):
-            start = dp_rank * self._tp_size
+        for local_dp_rank in range(num_dp):
+            global_dp_rank = self._dp_rank_offset + local_dp_rank
+            start = local_dp_rank * self._tp_size
             end = start + self._tp_size
             for phys in self._deployed[start:end]:
                 die = phys // self._npu_per_die
-                ranks_by_die.setdefault(die, set()).add(dp_rank)
+                ranks_by_die.setdefault(die, set()).add(global_dp_rank)
         self.dp_size = num_dp
         wanted = set(self._npu_ids)
         return {
@@ -409,13 +419,10 @@ class CatMonitorFaultSubscriber:
             self._active_faults[npu_id] = ev_type
 
         if ev_type in SCALE_DOWN_TYPES:
-            # Guard: only one scale_down per NPU at a time. Different fault
-            # types for the same DIE (e.g. non-benign npu_error_code followed
-            # by card_drop) can arrive while the first _wait_for_pause is still
-            # blocking; without this guard each would issue its own scale_down,
-            # and the stale duplicate would target ranks already removed by the
-            # first successful scale_down (vLLM then times out on non-existent
-            # engines).
+            # Guard: only one scale_down at a time. Different fault types
+            # for the same DIE arriving close together are deduplicated;
+            # faults for different DIEs while a scale_down is in progress
+            # raise RuntimeError because continuous scale_down is not supported.
             with self._lock:
                 if npu_id in self._handling:
                     print(
@@ -423,6 +430,13 @@ class CatMonitorFaultSubscriber:
                         f"{npu_id}, skip duplicate event {ev_type}"
                     )
                     return
+                if self._handling:
+                    raise RuntimeError(
+                        f"[faultsub] CONCURRENT FAULT: scale_down in progress "
+                        f"for DIEs {self._handling}, cannot handle fault on "
+                        f"DIE {npu_id} simultaneously. "
+                        f"Continuous scale_down is not supported."
+                    )
                 self._handling.add(npu_id)
             try:
                 # No unconditional pause here: vLLM auto-pauses when it observes
@@ -523,7 +537,7 @@ class CatMonitorFaultSubscriber:
 
     # ---- public lifecycle ----
 
-    def start(self, *, block: bool = False) -> None:
+    def start(self, *, block: bool = False, poll_interval: int = 30) -> None:
         self._server = ThreadingHTTPServer(
             (self.cfg.callback_host, self.cfg.callback_port), self._make_handler()
         )
@@ -547,6 +561,15 @@ class CatMonitorFaultSubscriber:
         if not self._subscription_id:
             print("[faultsub] WARNING: not registered with CATMonitor")
 
+        # Start status polling for DP rank renumbering detection.
+        self._poll_thread = threading.Thread(
+            target=self._poll_status_loop,
+            args=(poll_interval,),
+            daemon=True,
+            name="StatusPollThread",
+        )
+        self._poll_thread.start()
+
         if block:
             try:
                 while True:
@@ -555,13 +578,51 @@ class CatMonitorFaultSubscriber:
                 self.stop()
 
     def stop(self) -> None:
+        self._stop_event.set()
         self._unregister()
         if self._server:
             self._server.shutdown()
             self._server.server_close()
         if self._thread:
             self._thread.join(timeout=5)
+        if self._poll_thread:
+            self._poll_thread.join(timeout=5)
         print("[faultsub] stopped")
+
+    # ---- status polling for DP rank renumbering ----
+
+    def _poll_status_loop(self, interval: int = 30) -> None:
+        """Periodically poll vLLM status to detect DP rank renumbering.
+
+        When ``total_engines`` changes (scale_down on another node), rebuild
+        the NPU->DP mapping with the new dp_size.
+        """
+        url = f"http://{self.cfg.vllm_host}:{self.cfg.vllm_port}/fault_tolerance/status"
+        while not self._stop_event.is_set():
+            try:
+                resp = requests.get(url, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    engine_count = data.get("total_engines")
+                    if (
+                        engine_count is not None
+                        and self._last_engine_count is not None
+                        and engine_count != self._last_engine_count
+                    ):
+                        print(
+                            f"[faultsub] DP rank renumbering detected: "
+                            f"total_engines {self._last_engine_count} -> {engine_count}"
+                        )
+                        with self._lock:
+                            self.npu_to_dp = self._rebuild_npu_to_dp()
+                            print(
+                                f"[faultsub] rebuilt NPU->DP mapping: "
+                                f"{self.npu_to_dp}"
+                            )
+                    self._last_engine_count = engine_count
+            except requests.RequestException:
+                pass
+            self._stop_event.wait(interval)
 
 
 def build_npu_to_dp_ranks(
@@ -570,6 +631,7 @@ def build_npu_to_dp_ranks(
     visible_devices: List[int],
     dp_size: int,
     tp_size: int = 1,
+    dp_rank_offset: int = 0,
 ) -> Dict[int, List[int]]:
     """Map each CATMonitor ``npu_id`` (a DIE on A3) to the vLLM DP ranks of
     the physical NPU cards it hosts.
@@ -584,7 +646,8 @@ def build_npu_to_dp_ranks(
 
     ``npu_ids`` is the subscription scope (DIE ids reported by CATMonitor);
     ``visible_devices`` is ASCEND_RT_VISIBLE_DEVICES in DP-rank order;
-    ``tp_size`` is the tensor-parallel size (default 1).
+    ``tp_size`` is the tensor-parallel size (default 1);
+    ``dp_rank_offset`` is the global DP rank offset for this node (default 0).
     """
     total_cards = dp_size * tp_size
     if dp_size < 1 or total_cards > len(visible_devices):
@@ -593,11 +656,12 @@ def build_npu_to_dp_ranks(
             f"visible devices ({len(visible_devices)})"
         )
     ranks_by_die: Dict[int, set] = {}
-    for dp_rank in range(dp_size):
-        start = dp_rank * tp_size
+    for local_dp_rank in range(dp_size):
+        global_dp_rank = dp_rank_offset + local_dp_rank
+        start = local_dp_rank * tp_size
         end = start + tp_size
         for phys in visible_devices[start:end]:
             die = phys // npu_per_die
-            ranks_by_die.setdefault(die, set()).add(dp_rank)
+            ranks_by_die.setdefault(die, set()).add(global_dp_rank)
     wanted = set(npu_ids)
     return {d: sorted(ranks) for d, ranks in ranks_by_die.items() if d in wanted}

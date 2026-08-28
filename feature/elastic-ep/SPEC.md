@@ -146,6 +146,21 @@ pytest tests/v1/fault_tolerance/
 | `--local-model` | `nytopop/Qwen3-30B-A3B.w8a8` | 本地模型路径 |
 | `--recovery-timeout` | `120` | 引擎恢复超时时间（秒），故障暂停后等待重试/缩容指令的最长时间，超时则抛异常退出 |
 | `--gloo-timeout-seconds` | `30` | DP 域 Gloo CPU 通信组超时（秒）。故障 rank 同步阻塞时健康 rank 会等待此超时，需小于 `--recovery-timeout` 以避免容错指令超时 |
+| `--master-ip` | 空（单节点） | DP 主节点 IP，多节点部署时主/从节点均需设置；脚本据此附加 `--data-parallel-address`；单节点忽略 |
+| `--data-parallel-rpc-port` | `13389` | DP 主节点 RPC 端口（对应 vLLM `--data-parallel-rpc-port`），多节点部署时自动附加 |
+| `--num-nodes` | `1` | 集群总节点数。多节点时脚本自动计算 `--data-parallel-size-local = --dp-size / --num-nodes`（`--dp-size` 须能被整除），主/从节点本地的 DP 数相同 |
+| `--headless` | 不设置 | 从节点标志：只启动 engine core，不起 OpenAI API server；仅主节点提供 API |
+| `--data-parallel-start-rank` | `0` | 从节点第一个 local_rank 对应的全局 world_rank（对应 vLLM `--data-parallel-start-rank`）；主节点固定为 `0`，不必传 |
+
+> **多节点（hub-and-spoke）启动示例：** `docker run` 后分别在各节点运行脚本，`--dp-size` 传全局 DP 总数，脚本按 `--num-nodes` 均分各节点本地 DP：
+> ```bash
+> # 主节点（rank 0-{local-1}，起 API server）
+> bash ft_vllm_serve_qwen.sh --dp-size 8 --num-nodes 2 --master-ip <MASTER_IP>
+> # 从节点（rank {local}-{2*local-1}，无 API server）
+> bash ft_vllm_serve_qwen.sh --dp-size 8 --num-nodes 2 --master-ip <MASTER_IP> \
+>     --headless --data-parallel-start-rank 4
+> ```
+> 注意：主/从节点需各自设置本机 `LOCAL_IP`/`NIC_NAME`（HCCL/Gloo/TP 网卡绑定）后再启动。
 
 #### 5.1.4 scale_down_demo.py 脚本参数
 
@@ -156,6 +171,10 @@ pytest tests/v1/fault_tolerance/
 | `--visible-devices` | `0-15` | vLLM 可见的物理卡 ID（对应 `ASCEND_RT_VISIBLE_DEVICES`，按 DP rank 顺序）；DP rank `r` 绑定 `visible_devices[r*tp_size:(r+1)*tp_size]` |
 | `--dp-size` | `len(--visible-devices) / tp-size` | vLLM 数据并行大小（DP rank 数量），须 ≤ 可见卡数 / tp-size；默认用全部可见卡 |
 | `--tp-size` | `1` | 张量并行大小，每个 DP rank 占用 tp-size 张物理卡 |
+| `--node-rank` | `0` | 当前节点在集群中的编号（0-indexed），配合 `--num-nodes` 计算 DP rank 偏移 |
+| `--num-nodes` | `1` | 集群总节点数（`dp_size` 须能被 `num-nodes` 整除） |
+| `--master-host` | `--host` | 主节点 vLLM API 地址（缩容指令发送目标），默认与 `--host` 相同 |
+| `--master-port` | `--port` | 主节点 vLLM API 端口（缩容指令发送目标），默认与 `--port` 相同 |
 | `--external-fault-notify-port` | `22867` | 订阅引擎健康状态的 ZMQ SUB 端口（需与 vLLM 的 `--fault-port` 一致） |
 | `--port` | `8006` | vLLM API 端口，用于发送暂停/缩容指令 |
 | `--host` | `localhost` | vLLM API 主机地址 |
@@ -177,6 +196,8 @@ pytest tests/v1/fault_tolerance/
 > **并发防重与 recovered 互斥（同一 DIE）：** webhook 事件各自线程处理，去重仅按同类型匹配，因此对同一 DIE 实施"缩容进行中"互斥：已在该 DIE 缩容流程中时，后续非 recovered 事件（无论类型）直接跳过，避免第二轮针对已剔除 rank 的重复缩容；**recovered 事件同样受互斥保护**——空闲场景缩容窗口较长，此间到达的 `recovered=true` 若 pop 掉 `_active_faults` 会发出指向被剔除引擎的 stale `retry`（vLLM 对不存在的引擎超时 → 500 并拖垮并行缩容），故缩容进行中到达的 recovered 直接忽略，`_active_faults` 只在缩容成功后清理。不同 DIE 仍可并行缩容。
 
 > 已移除 `--interval-time`（DCMI 轮询专用，不再需要）。
+
+> **多节点部署（Hub-and-Spoke）：** 每个节点独立运行 `scale_down_demo.py`，通过 `--node-rank`/`--num-nodes` 计算 `dp_rank_offset`，将本地故障映射到全局 DP rank。缩容指令始终发送至 `--master-host`/`--master-port`（默认与 `--host`/`--port` 相同）。其他节点缩容导致 DP rank 重排时，通过轮询 `GET /fault_tolerance/status` 的 `total_engines` 检测变化并自动重建 NPU→DP 映射。
 
 ### 5.2 配置文件
 

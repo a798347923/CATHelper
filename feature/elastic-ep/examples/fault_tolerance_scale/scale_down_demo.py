@@ -223,6 +223,34 @@ def main():
         help="vLLM tensor-parallel size (default: 1). Each DP rank occupies "
              "tp-size consecutive physical cards",
     )
+    # Multi-node arguments.
+    parser.add_argument(
+        "--node-rank",
+        type=int,
+        default=0,
+        help="This node's rank in the cluster (0-indexed, default: 0). "
+             "Used with --num-nodes to calculate DP rank offset",
+    )
+    parser.add_argument(
+        "--num-nodes",
+        type=int,
+        default=1,
+        help="Total number of nodes in the cluster (default: 1). "
+             "dp_size must be divisible by num-nodes",
+    )
+    parser.add_argument(
+        "--master-host",
+        default=None,
+        help="Master node's vLLM API host for scale_down commands. "
+             "Default: same as --host",
+    )
+    parser.add_argument(
+        "--master-port",
+        type=int,
+        default=None,
+        help="Master node's vLLM API port for scale_down commands. "
+             "Default: same as --port",
+    )
     # CATMonitor subscription (Path 1) arguments.
     parser.add_argument(
         "--catmonitor-host", default="localhost", help="CATMonitor daemon host"
@@ -275,28 +303,55 @@ def main():
     args = parser.parse_args()
 
     dp_size = args.dp_size if args.dp_size is not None else len(args.visible_devices) // args.tp_size
-    total_cards = dp_size * args.tp_size
-    if dp_size < 1 or total_cards > len(args.visible_devices):
+
+    # Multi-node DP rank offset calculation.
+    master_host = args.master_host if args.master_host is not None else args.host
+    master_port = args.master_port if args.master_port is not None else args.port
+
+    if args.num_nodes < 1:
+        parser.error(f"--num-nodes must be >= 1, got {args.num_nodes}")
+    if args.node_rank < 0 or args.node_rank >= args.num_nodes:
         parser.error(
-            f"--dp-size {dp_size} * --tp-size {args.tp_size} = {total_cards} "
-            f"exceeds visible devices ({len(args.visible_devices)})"
+            f"--node-rank {args.node_rank} out of range "
+            f"(num-nodes={args.num_nodes})"
+        )
+    if dp_size % args.num_nodes != 0:
+        parser.error(
+            f"dp_size={dp_size} must be divisible by num-nodes={args.num_nodes}"
+        )
+
+    dp_per_node = dp_size // args.num_nodes
+    dp_rank_offset = args.node_rank * dp_per_node
+    local_dp_size = dp_per_node
+
+    total_cards = local_dp_size * args.tp_size
+    if total_cards > len(args.visible_devices):
+        parser.error(
+            f"node {args.node_rank}: local_dp_size={local_dp_size} * "
+            f"tp-size={args.tp_size} = {total_cards} exceeds "
+            f"visible devices ({len(args.visible_devices)})"
         )
 
     # CATMonitor reports faults per DIE (npu_id = DIE id, e.g. 0-7 on A3);
     # vLLM ranks are per physical card. Map each DIE to the DP ranks of the
     # physical cards it hosts so scale_down excludes the right ranks.
     # With TP>1, each DP rank occupies tp_size consecutive physical cards.
+    # With multi-node, dp_rank_offset shifts local ranks to global numbering.
     npu_ids = args.npu_ids
     if npu_ids is None:
         npu_ids = sorted(
             {p // args.npu_per_die for p in args.visible_devices[:total_cards]}
         )
     npu_to_dp = build_npu_to_dp_ranks(
-        npu_ids, args.npu_per_die, args.visible_devices, dp_size, args.tp_size
+        npu_ids, args.npu_per_die, args.visible_devices,
+        local_dp_size, args.tp_size, dp_rank_offset,
     )
     print(
         f"NPU->DP mapping: {npu_to_dp} "
-        f"({len(npu_ids)} DIE subscribed, dp-size={dp_size}, "
+        f"({len(npu_ids)} DIE subscribed, dp-size={dp_size} "
+        f"(local={local_dp_size}), "
+        f"node-rank={args.node_rank}/{args.num_nodes}, "
+        f"dp-rank-offset={dp_rank_offset}, "
         f"tp-size={args.tp_size}, "
         f"visible-devices={args.visible_devices}, "
         f"fault types={args.fault_types}, "
@@ -323,10 +378,11 @@ def main():
         cfg,
         npu_to_dp,
         visible_devices=list(args.visible_devices),
-        dp_size=dp_size,
+        dp_size=local_dp_size,
         npu_per_die=args.npu_per_die,
         npu_ids=list(npu_ids),
         tp_size=args.tp_size,
+        dp_rank_offset=dp_rank_offset,
     )
     subscriber.start(block=False)
 
@@ -335,8 +391,8 @@ def main():
         target=start_monitor_engine_status,
         daemon=True,
         args=(
-            args.host,
-            args.port,
+            master_host,
+            master_port,
             args.recovery_timeout,
             args.external_fault_notify_port,
         ),

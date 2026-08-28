@@ -4,6 +4,33 @@
 
 ---
 
+## v0.2.0
+
+| 项目 | 说明 |
+|------|------|
+| 版本号 | v0.2.0 |
+| 发布时间 | 2026-08-26 |
+| 发布人 | w30024811 |
+| 框架支持 | vLLM + vLLM-Ascend |
+| 许可证 | Apache License 2.0 |
+
+### 特性能力摘要
+
+- **多节点容错**：scale_down_demo.py 新增 `--node-rank`、`--num-nodes`、`--master-host`、`--master-port` 参数，支持 hub-and-spoke 模式：各节点独立检测本地 NPU 故障，通过 dp_rank_offset 映射到全局 DP rank，所有缩容指令统一发送至主节点
+- **多节点 vLLM 拉起**：ft_vllm_serve_qwen.sh 新增 `--master-ip`、`--data-parallel-rpc-port`、`--num-nodes`、`--headless`、`--data-parallel-start-rank` 参数，主/从节点分别运行脚本拉起分布式 DP 部署，脚本自动均分本地 DP 数并附加 vLLM 多节点参数
+- **并发故障保护**：同一 DIE 有缩容在进行时，后续故障事件（除 recovered 外）直接 raise RuntimeError 拒绝，避免重复缩容
+- **DP rank 重排检测**：通过轮询 vLLM `/fault_tolerance/status` 检测 total_engines 变化，自动重建 NPU→DP 映射
+
+### 兼容性与限制
+
+| 特性 | 状态 | 说明 |
+|------|------|------|
+| Tensor Parallel | 已支持 | 支持 TP>=1，TP>1 时每个 DP rank 占用 tp_size 张物理卡 |
+| 多节点部署 | 已支持 | dp_size 须能被 num_nodes 整除，各节点 local_dp_size = dp_size / num_nodes |
+| 主节点故障 | 有限 | 缩容指令超时（recovery-timeout）后报错，无自动切换 |
+
+---
+
 ## v0.1.0
 
 | 项目 | 说明 |
