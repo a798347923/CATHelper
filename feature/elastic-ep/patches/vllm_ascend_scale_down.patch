@@ -1874,13 +1874,14 @@ Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 ===================================================================
 diff --git a/vllm_ascend/worker/sentinel/npu_worker_sentinel.py b/vllm_ascend/worker/sentinel/npu_worker_sentinel.py
 new file mode 100644
---- /dev/null	(revision bd7d073f9bdc1bf839c5825e71e0b02de938c68b)
-+++ b/vllm_ascend/worker/sentinel/npu_worker_sentinel.py	(revision bd7d073f9bdc1bf839c5825e71e0b02de938c68b)
-@@ -0,0 +1,258 @@
+--- /dev/null	(revision 8db61cf90646fabca6a2a27ec69c24d109b5b28b)
++++ b/vllm_ascend/worker/sentinel/npu_worker_sentinel.py	(revision 8db61cf90646fabca6a2a27ec69c24d109b5b28b)
+@@ -0,0 +1,313 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +import threading
 +from datetime import timedelta
++from typing import Callable
 +
 +import msgspec
 +import torch
@@ -1897,6 +1898,7 @@ new file mode 100644
 +from vllm.v1.fault_tolerance import BaseSentinel
 +from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
 +from vllm.v1.worker.worker_base import WorkerBase
++from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 +
 +from vllm_ascend.ascend_config import get_ascend_config
 +from vllm_ascend.distributed.parallel_state import get_elastic_info
@@ -1904,6 +1906,45 @@ new file mode 100644
 +from vllm_ascend.worker.sentinel.scale_down import ScaleDownHelper
 +
 +_GLOBAL_PAUSE_EVENT = threading.Event()
++
++
++def fault_barrier_wrapper(func: Callable):
++    """Quarantine and reset the worker when a wrapped method faults."""
++
++    def wrapped(self, *args, **kwargs):
++        sentinel = getattr(self, "worker_sentinel", None)
++        if sentinel is not None and sentinel.worker_faulted:
++            logger.warning(
++                "[FT-DIAG][sentinel] worker_faulted=True, short-circuit "
++                "returning EMPTY_MODEL_RUNNER_OUTPUT for method=%s rank=%d "
++                "worker_faulted=%s",
++                getattr(func, "__name__", func),
++                getattr(self, "rank", None),
++                sentinel.worker_faulted,
++            )
++            return EMPTY_MODEL_RUNNER_OUTPUT
++        try:
++            return func(self, *args, **kwargs)
++        except SystemExit:
++            raise
++        except Exception as exc:
++            if sentinel is not None:
++                sentinel.worker_faulted = True
++                logger.warning("[FT] Quarantining worker %d after fault: %s", self.rank, exc)
++                try:
++                    from vllm_ascend.platform import NPUPlatform
++
++                    NPUPlatform.set_device(self.device)
++                    torch_npu.npu.stop_device(self.device.index)
++                    torch_npu.npu.restart_device(self.device.index)
++                    torch_npu.distributed.reinit_process_group(None, False)
++                    torch.npu.synchronize()
++                except Exception:
++                    logger.exception("[FT] self device reset failed on worker %d.", self.rank)
++                return EMPTY_MODEL_RUNNER_OUTPUT
++            raise
++
++    return wrapped
 +
 +
 +def get_pause_event() -> threading.Event:
@@ -1942,6 +1983,7 @@ new file mode 100644
 +        self.device = device
 +        self.data_parallel_master_ip = parallel_config.data_parallel_master_ip
 +        self.data_parallel_master_port = parallel_config.data_parallel_master_port
++        self.worker_faulted = False
 +        self.dp_size = parallel_config.data_parallel_size
 +        torch.accelerator.set_device_index(self.device)
 +        self.set_dp_gloo_timeout(parallel_config)
@@ -2005,6 +2047,7 @@ new file mode 100644
 +        )
 +        timeout = timedelta(seconds=self.worker.parallel_config.gloo_timeout_seconds)
 +        _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
++        self.worker_faulted = False
 +        return FaultToleranceResult(ft_request.request_id, True)
 +
 +    def shutdown(self):
@@ -2020,6 +2063,12 @@ new file mode 100644
 +        self.scale_down_worker(exclude_ep_ranks, vllm_config_update_dict, store)
 +        self.worker.execute_dummy_batch()
 +        torch.npu.synchronize()
++        self.worker_faulted = False
++        logger.info(
++            "[FT-DIAG][sentinel] scale_down complete, worker_faulted cleared "
++            "to False on rank=%s",
++            getattr(self, "rank", None),
++        )
 +        return FaultToleranceResult(ft_request.request_id, True)
 +
 +    def scale_down_worker(self, excluded_ep_ranks: list[int], scale_down_config, coord_store):
@@ -2116,6 +2165,12 @@ new file mode 100644
 +        # clean device states
 +        NPUPlatform.set_device(self.device)
 +        torch_npu.npu.stop_device(self.device.index)
++        try:
++            t = torch.Tensor([[0.5,0.5], [0.3,0.7], [0.8,0.2], [0.6, 0.4]]).to(self.device)
++            res = torch.matmul(t, t.t())
++            print(f"res = {res}")
++        except RuntimeError as e:
++            print(f"Failed to clean up {e}")
 +        torch_npu.npu.restart_device(self.device.index)
 +        torch_npu.distributed.reinit_process_group(None, False)
 +        torch.npu.synchronize()
@@ -2142,9 +2197,9 @@ Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 ===================================================================
 diff --git a/vllm_ascend/worker/sentinel/scale_down.py b/vllm_ascend/worker/sentinel/scale_down.py
 new file mode 100644
---- /dev/null	(revision bd7d073f9bdc1bf839c5825e71e0b02de938c68b)
-+++ b/vllm_ascend/worker/sentinel/scale_down.py	(revision bd7d073f9bdc1bf839c5825e71e0b02de938c68b)
-@@ -0,0 +1,874 @@
+--- /dev/null	(revision 8db61cf90646fabca6a2a27ec69c24d109b5b28b)
++++ b/vllm_ascend/worker/sentinel/scale_down.py	(revision 8db61cf90646fabca6a2a27ec69c24d109b5b28b)
+@@ -0,0 +1,880 @@
 +import contextlib
 +import socket
 +import struct
@@ -2656,7 +2711,13 @@ new file mode 100644
 +
 +        num_dense_layers = getattr(self.model_runner.get_model().config, "first_k_dense_replace", 0)
 +        model_config = self.model_runner.get_model().config
-+        num_hidden_layers = getattr(model_config, "num_hidden_layers", getattr(model_config.text_config, "num_hidden_layers", 0))
++        num_hidden_layers = getattr(model_config, "num_hidden_layers", None)
++        if num_hidden_layers is None:
++            text_config = getattr(model_config, "text_config", None)
++            if text_config is not None:
++                num_hidden_layers = getattr(text_config, "num_hidden_layers", 0)
++            else:
++                num_hidden_layers = 0
 +        num_mtp_layers = self._get_mtp_num_layers()
 +        num_main_moe_layers = num_hidden_layers - num_dense_layers
 +
@@ -3026,7 +3087,7 @@ Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 ===================================================================
 diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
 --- a/vllm_ascend/worker/worker.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
-+++ b/vllm_ascend/worker/worker.py	(revision bd7d073f9bdc1bf839c5825e71e0b02de938c68b)
++++ b/vllm_ascend/worker/worker.py	(revision 8db61cf90646fabca6a2a27ec69c24d109b5b28b)
 @@ -19,6 +19,7 @@
  
  import copy
@@ -3052,7 +3113,7 @@ diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
      register_ascend_customop,
  )
  from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-+from vllm_ascend.worker.sentinel.npu_worker_sentinel import NPUWorkerSentinel, get_pause_event
++from vllm_ascend.worker.sentinel.npu_worker_sentinel import NPUWorkerSentinel, get_pause_event, fault_barrier_wrapper
 +from vllm_ascend.worker.sentinel.scale_down import init_elastic_info, init_ep2dp_map, patch_get_all_weights
 +
 +
@@ -3153,15 +3214,24 @@ diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
  
      @torch.inference_mode()
      def determine_available_memory(self) -> int:
-@@ -360,6 +426,7 @@
+@@ -360,6 +426,8 @@
  
          return int(self.available_kv_cache_memory_bytes)
  
-+    @fault_detected_on_exception
++    @fault_barrier_wrapper
++    # @fault_detected_on_exception
      def execute_model(
          self,
          scheduler_output: "SchedulerOutput",
-@@ -436,8 +503,18 @@
+@@ -423,6 +491,7 @@
+         return output
+ 
+     @torch.inference_mode()
++    @fault_barrier_wrapper
+     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
+         return self.model_runner.sample_tokens(grammar_output)
+ 
+@@ -436,8 +505,18 @@
  
              context = nullcontext()  # type: ignore
  
@@ -3181,7 +3251,7 @@ diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
  
      def compile_or_warm_up_model(self) -> float:
          # Note: need to adapt for graph mode.
-@@ -569,6 +646,7 @@
+@@ -569,6 +648,7 @@
      def reset_encoder_cache(self) -> None:
          self.model_runner.reset_encoder_cache()
  
@@ -3189,7 +3259,7 @@ diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
      def execute_dummy_batch(self) -> None:
          self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=True)
  
-@@ -639,6 +717,10 @@
+@@ -639,6 +719,10 @@
      def check_health(self) -> None:
          import subprocess
  
@@ -3381,7 +3451,7 @@ Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 ===================================================================
 diff --git a/vllm_ascend/spec_decode/eagle_proposer.py b/vllm_ascend/spec_decode/eagle_proposer.py
 --- a/vllm_ascend/spec_decode/eagle_proposer.py	(revision bd7d073f9bdc1bf839c5825e71e0b02de938c68b)
-+++ b/vllm_ascend/spec_decode/eagle_proposer.py	(revision 114001b648429829d769986e786dae45af512ded)
++++ b/vllm_ascend/spec_decode/eagle_proposer.py	(revision 8db61cf90646fabca6a2a27ec69c24d109b5b28b)
 @@ -243,6 +243,13 @@
                  else self.model.mask_hidden.view(self.hidden_size)
              )
