@@ -197,7 +197,7 @@ pytest tests/v1/fault_tolerance/
 
 > 已移除 `--interval-time`（DCMI 轮询专用，不再需要）。
 
-> **多节点部署（Hub-and-Spoke）：** 每个节点独立运行 `scale_down_demo.py`，通过 `--node-rank`/`--num-nodes` 计算 `dp_rank_offset`，将本地故障映射到全局 DP rank。缩容指令始终发送至 `--master-host`/`--master-port`（默认与 `--host`/`--port` 相同）。其他节点缩容导致 DP rank 重排时，通过轮询 `GET /fault_tolerance/status` 的 `total_engines` 检测变化并自动重建 NPU→DP 映射。
+> **多节点部署（Hub-and-Spoke）：** 每个节点独立运行 `scale_down_demo.py`，通过 `--node-rank`/`--num-nodes` 计算 `dp_rank_offset`，将本地故障映射到全局 DP rank。缩容指令始终发送至 `--master-host`/`--master-port`（默认与 `--host`/`--port` 相同）。**主/从节点的引擎健康订阅（ZMQ）均连接 master 的全局广播，但每个节点只在 `dp_rank_offset` 起始的本地 DP rank 窗口内响应 dead 事件（node-rank 0 拥有 0~dp_per_node-1，node-rank 1 拥有 dp_per_node~2*dp_per_node-1），窗口互斥**——同一 rank 只由一个节点响应，避免多节点对同一故障并发重复 scale_down。缩容成功广播携带 `original_to_new` 重编号映射，各节点据此 rebase 本地窗口。其他节点缩容导致 DP rank 重排时，通过轮询 `GET /fault_tolerance/status` 的 `total_engines` 检测变化并自动重建 NPU→DP 映射。
 
 ### 5.2 配置文件
 

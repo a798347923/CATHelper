@@ -54,6 +54,15 @@ _fault_event_endpoint = None
 
 
 def listen_fault_event(host, port):
+    """Receive the next engine-health broadcast from the master coordinator.
+
+    Returns a dict:
+      ``dead_ranks``: global DP ranks reported ``dead`` in this broadcast.
+      ``original_to_new``: old->new engine index map from a ``scale_down``
+          broadcast (present only right after a successful scale_down). It
+          lets subscribers rebase their owned-rank window when the cluster
+          renumbers engines, so stale ranks never trigger a second action.
+    """
     global _fault_event_context, _fault_event_socket, _fault_event_endpoint
     if _fault_event_context is None:
         _fault_event_context = zmq.Context()
@@ -72,7 +81,10 @@ def listen_fault_event(host, port):
     msg = decoder.decode(frames[-1])
     engines = msg.get("engines", [])
     dead_engine = [int(e["id"]) for e in engines if e.get("status") == "dead"]
-    return dead_engine
+    return {
+        "dead_ranks": dead_engine,
+        "original_to_new": msg.get("original_to_new"),
+    }
 
 
 def scale(host, port, timeout, exclude_dp_ranks):
@@ -135,17 +147,53 @@ def wait_for_pause(host, port, exclude_dp_ranks, poll_interval=2, max_wait=120):
     return False
 
 
-def start_monitor_engine_status(host, port, timeout, external_fault_notify_port):
+def start_monitor_engine_status(host, port, timeout, external_fault_notify_port, local_ranks):
+    """Monitor engine health via ZMQ SUB and issue scale_down for THIS node's ranks.
+
+    The broadcast from the master coordinator covers the whole cluster, but
+    under the strict per-node ownership model each node may only act on the
+    global DP ranks it owns (``local_ranks``). Dead ranks outside the window
+    are ignored (their owning node's own monitor / Path 1 handles them), so a
+    single engine death never produces two concurrent scale_down requests.
+
+    The owned window is rebased using ``original_to_new`` carried in every
+    scale_down broadcast, so after a cluster-wide renumbering the monitor
+    keeps tracking the correct ranks. Ranks whose scale_down already failed
+    are not retried in a hot loop (that previously burned 120s per duplicated
+    dead-rank broadcast).
+    """
+    owned = set(local_ranks)
+    failed = set()
     scaled_down_ranks: set[int] = set()
+    print(f"Engine-health monitor owns DP ranks {sorted(owned)}"
+          if owned else "Engine-health monitor owns no ranks")
     while True:
-        exclude_dp_ranks = listen_fault_event(host, external_fault_notify_port)
-        new_ranks = [r for r in exclude_dp_ranks if r not in scaled_down_ranks]
+        event = listen_fault_event(host, external_fault_notify_port)
+        rebase = event.get("original_to_new")
+        if rebase:
+            # original_to_new covers exactly the surviving engines; ranks not
+            # in it were removed by the scale_down, so drop them from the
+            # owned window instead of keeping stale ids.
+            rebase = {int(k): int(v) for k, v in rebase.items()}
+            owned = {rebase[r] for r in owned if r in rebase}
+            print(f"Rebased owned ranks after scale_down renumbering: {sorted(owned)}")
+        dead = [r for r in event["dead_ranks"] if r in owned]
+        if not dead:
+            continue
+        new_ranks = [r for r in dead if r not in scaled_down_ranks and r not in failed]
         if not new_ranks:
+            print(f"Engine health event: dead ranks {dead} already handled, skip")
             continue
         print(f"Engine health event: dead ranks {new_ranks}")
         if wait_for_pause(host, port, new_ranks):
             if scale(host, port, timeout, new_ranks):
                 scaled_down_ranks.update(new_ranks)
+            else:
+                failed.update(new_ranks)
+                print(f"scale_down failed for {new_ranks}, not retrying")
+        else:
+            failed.update(new_ranks)
+            print(f"pause did not complete for {new_ranks}, not retrying")
 
 
 def parse_error_codes(raw: str) -> List[str]:
@@ -323,6 +371,7 @@ def main():
     dp_per_node = dp_size // args.num_nodes
     dp_rank_offset = args.node_rank * dp_per_node
     local_dp_size = dp_per_node
+    local_ranks = set(range(dp_rank_offset, dp_rank_offset + local_dp_size))
 
     total_cards = local_dp_size * args.tp_size
     if total_cards > len(args.visible_devices):
@@ -358,10 +407,12 @@ def main():
         f"ignore-error-codes={args.ignore_error_codes})"
     )
 
-    # Path 1: CATMonitor fault-event subscription.
+    # Path 1: CATMonitor fault-event subscription. scale_down commands always
+    # target the master node's vLLM API, regardless of which node owns the
+    # faulted rank.
     cfg = FaultSubscriberConfig(
-        vllm_host=args.host,
-        vllm_port=args.port,
+        vllm_host=master_host,
+        vllm_port=master_port,
         catmonitor_host=args.catmonitor_host,
         catmonitor_rest_port=args.catmonitor_rest_port,
         callback_host=args.callback_host,
@@ -386,7 +437,12 @@ def main():
     )
     subscriber.start(block=False)
 
-    # Path 2: vLLM engine-health ZMQ SUB (unchanged EEP-internal boundary).
+    # Path 2: vLLM engine-health ZMQ SUB. The coordinator's broadcast is
+    # cluster-global, so EVERY node runs this monitor but each node only
+    # reacts to the DP ranks it owns (``local_ranks``). The per-node windows
+    # are disjoint, so a single engine death can never trigger duplicate
+    # concurrent scale_down from two nodes, while each node still detects
+    # engine deaths on its own ranks (CATMonitor only sees hardware faults).
     monitor_thread = threading.Thread(
         target=start_monitor_engine_status,
         daemon=True,
@@ -395,6 +451,7 @@ def main():
             master_port,
             args.recovery_timeout,
             args.external_fault_notify_port,
+            local_ranks,
         ),
         name="EngineHealthThread",
     )

@@ -161,6 +161,7 @@ python examples/fault_tolerance_scale/scale_down_demo.py \
     --advertise-url http://<node1-ip>:9103/fault_event \
     --external-fault-notify-port 22867 --master-host <master-ip> --master-port 8006
 ```
+主/从节点的启动命令完全一致（仅 `--node-rank` / 回调端口 / master 地址不同）。每个节点运行外部故障管理中心时自动按 `dp_rank_offset` 计算**自己拥有的 DP rank 窗口**（如 node-rank 0 拥有 0-3，node-rank 1 拥有 4-7），只在窗口内响应引擎死亡事件，避免多个节点对同一个故障 rank 并发发出重复缩容指令；缩容成功后接收广播中的 `original_to_new` 重编号映射，自动 rebase 本地窗口。
 其他节点缩容导致 DP rank 重排时，各节点通过轮询 `GET /fault_tolerance/status` 的 `total_engines` 自动检测并重建 NPU→DP 映射。多节点 + TP>1 同样支持：各节点再传 `--tp-size`（vLLM 与 demo 同步），本地卡数 = `dp_size / num_nodes * tp_size`；TP 分组不跨节点。
 
 **步骤 3：发送推理请求**
