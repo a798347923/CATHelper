@@ -32,7 +32,7 @@ Elastic EP 是 **DP(data parallel)+EP(expert parallel)** 部署模式下的**卡
 
 ## 何时用 / 何时不用
 
-**用**：用户想（a）确认某个运行中的 vLLM 服务是否开了容错；（b）知道拉起带容错的 vLLM 服务要传哪些参数；（c）在故障发生后执行重试/缩容——"帮我 retry"、"3 号卡挂了，帮我 scale_down"。
+**用**：用户想（a）确认某个运行中的 vLLM 服务是否开了容错；（b）知道拉起带容错的 vLLM 服务要传哪些参数；（c）在故障发生后执行重试/缩容——"帮我 retry"、"3 号卡挂了，帮我 scale_down"；（d）给服务发一个测试请求，验证推理链路是否正常；（e）kill 掉一个 rank 进程制造故障，演练缩容恢复流程（仅测试环境）。
 
 **不用**：用户想定位**为什么**出了故障（那是诊断，不是容错操作）；或对非昇腾 A3 / 未打补丁的环境。
 
@@ -57,6 +57,9 @@ Elastic EP 是 **DP(data parallel)+EP(expert parallel)** 部署模式下的**卡
 python <本 SKILL.md 所在目录>/scripts/eep.py status --tool-url http://<tool-layer>:<port> --host <vllm-host> --port 8006
 python <本 SKILL.md 所在目录>/scripts/eep.py apply  --tool-url http://<tool-layer>:<port> --host <vllm-host> --port 8006 --instruction retry --timeout 30 --verify
 python <本 SKILL.md 所在目录>/scripts/eep.py launch --model <model-path> --model-name <served-name> --dp-size 4 --redundant-experts 48 --tool-url http://<tool-layer>:<port>
+python <本 SKILL.md 所在目录>/scripts/eep.py probe  --tool-url http://<tool-layer>:<port> --host <vllm-host> --port 8006
+python <本 SKILL.md 所在目录>/scripts/eep.py kill-rank --tool-url http://<tool-layer>:<port> --host <vllm-host> --port 8006 --yes   # 随机杀一个非 dead rank（仅测试）
+python <本 SKILL.md 所在目录>/scripts/eep.py kill-rank --ssh user@<node> --direct --host <vllm-host> --port 8006 --rank 2 --yes  # 无工具层应急：SSH 直杀（仅测试）
 # 纯本地取证（对已保存的 status JSON 出裁决，不联网）：
 python <本 SKILL.md 所在目录>/scripts/eep.py status --json - < status.json
 ```
@@ -115,6 +118,27 @@ python <本 SKILL.md 所在目录>/scripts/eep.py status --json - < status.json
 4. **下发 + 复验**：`vllm_ft_apply`（或 `eep.py apply --verify`）→ `200` 只代表框架侧成功，**必须复验 status**（retry 后全 healthy；scale_down 后 total_engines 减少且全 healthy）。
 5. **出证据**：贴「指令 + HTTP 状态码 + status 复验原文」。
 
+### 能力④ 测试请求探测（probe）
+
+问"服务还能不能推理"（故障前后、恢复后验证）：
+
+1. 经工具层执行 `vllm_probe_request`（或 `eep.py probe`）向 `POST /v1/chat/completions` 发送最小化请求（默认 prompt `ping`、`max_tokens=1`）；
+2. `200` → `PROBE_OK`（附回复与耗时）——这是"已恢复"的**最强证据**，`retry`/`scale_down` 复验 healthy 后建议再 probe 一次；
+3. 非 200 → `PROBE_FAILED`（附状态码 + body 原文）；连接失败/超时 → `PROBE_UNREACHABLE`（≠ 服务坏，先排查连通性）。
+
+### 能力⑤ 故障注入演练（kill-rank，仅测试）
+
+用户要"kill 一个 rank 制造故障、演练缩容"时，**决策门**（顺序固定，完整表见 [decision-rules.md §9](references/decision-rules.md)）：
+
+1. **优先走工具层**：`eep.py kill-rank --tool-url ...`；无工具层的独立测试环境可用 `--ssh [USER@]HOST` 应急通道（此时状态来源用 `--direct` 或 `--json`）——Agent 直连节点，**属例外**，需用户明确同意；
+2. **先判容错能力**：未启用且无 `--force` → 拒绝（杀 rank 会直接崩掉整个实例）；`--force` 仅限非容错实验且必须显式 `--rank`；
+3. **选目标**：默认随机挑一个非 `dead` rank；`--rank N` 指定时校验范围与是否已 dead；全部 dead → 拒绝；
+4. **必须确认**：无 `--yes` → 拒绝并提示目标 rank，重跑带 `--yes`；
+5. **下发**：经 `vllm_kill_rank`（`confirmed=true`）执行，工具层二次校验（M8–M10）；`--ssh` 模式下由 Agent 远程执行 `pgrep -f 'EngineCore_DP<rank>'` + `kill -9`（默认模式 `EngineCore_DP{rank}([[:space:]]|$)`，可用 `--pattern` 覆盖；找不到时输出 `ps` 候选供排查）；
+6. **演练链路**：被杀 rank 上报故障 → 框架**自动 pause** 存活 rank → `status` 观察（被杀 rank `dead`、其余 `paused`/`unhealthy`）→ `apply scale_down --exclude-dp-ranks <被杀rank>` → 复验 healthy + probe。
+
+> `--ssh` 前提：目标节点与 vLLM 进程同用户（或 root）、SSH 免密/BatchMode 可用；多节点部署时 `--ssh` 的节点必须**就是**该 DP rank 所在节点。
+
 ## 安全红线（必须遵守）
 
 - **不代发 `pause`**：未就绪时轮询等待；框架自动 pause 完成后 rank 会进入 paused/unhealthy/dead。
@@ -123,17 +147,20 @@ python <本 SKILL.md 所在目录>/scripts/eep.py status --json - < status.json
 - **scale_down 不可逆**：下发前**必须与用户确认**要排除的 rank 清单（这是不可恢复操作，无 scale_up）；确认后 `exclude_dp_ranks` 一字不差地传。
 - **连续缩容受限**：已知问题——缩容后再缩容偶现失败；并发缩容不支持。若用户要连续缩容，明确告知风险，且必须等前一次复验 healthy 后再做下一次。
 - **恢复窗口**：`engine_recovery_timeout_sec`（默认 120s）超时引擎抛原始异常退出——决策拖延等于让服务退出。等待阶段要主动提醒用户剩余窗口。
-- **不直连集群**：Agent 不 SSH/直连 NPU 计算节点，一律走 CAT 工具层。`eep.py --direct` 仅限调试且需用户明确同意。
+- **kill-rank 仅限测试**：这是破坏性故障注入。未开容错时杀 rank 会**直接崩掉整个实例**——默认拒绝（`--force` 仅限明确的非容错实验）；必须 `--yes` 确认；优先经工具层执行。`--ssh` 仅限**无工具层**的独立测试环境，且需用户明确同意。
+- **不直连集群**：Agent 不 SSH/直连 NPU 计算节点，一律走 CAT 工具层。`eep.py --direct` 仅限调试且需用户明确同意；`kill-rank --ssh` 是应急通道（同时只用 `--direct`/`--json` 读状态），默认应走工具层。
 
 ## 标准工作流
 
 ```text
-- [ ] 1. 确认意图属于能力①/②/③；确认服务 host:port 与工具层地址
+- [ ] 1. 确认意图属于能力①/②/③/④/⑤；确认服务 host:port 与工具层地址
 - [ ] 2. 能力①：status 探测（eep.py status）→ FT_ENABLED / FT_DISABLED / FT_UNKNOWN / STATUS_MISSING / STATUS_INCONSISTENT
 - [ ] 3. 能力②：按 launch-parameters.md 列参 + 先过硬约束，给出可执行命令
 - [ ] 4. 能力③：决策门——能力 → rank 状态 → 指令选择 → 下发 → 复验
-- [ ] 5. 出证据：贴「命令 + 状态码 + JSON 原文」
-- [ ] 6. 等待场景：轮询 status，直到无 healthy rank；提醒用户恢复窗口剩余时间
+- [ ] 5. 能力④：probe 验证推理链路（PROBE_OK / PROBE_FAILED / PROBE_UNREACHABLE）
+- [ ] 6. 能力⑤：kill-rank 故障注入演练——能力 → 目标 → --yes → 工具层下发 → status 观察自动 pause → scale_down 演练
+- [ ] 7. 出证据：贴「命令 + 状态码 + JSON 原文」
+- [ ] 8. 等待场景：轮询 status，直到无 healthy rank；提醒用户恢复窗口剩余时间
 ```
 
 ## 常见错误
@@ -151,10 +178,14 @@ python <本 SKILL.md 所在目录>/scripts/eep.py status --json - < status.json
 - **timeout 太小** → 500 "Timed out after Ns waiting for engine responses."；放大 params.timeout。
 - **recovery_timeout ≤ max(gloo_timeout, 100)** → 启动即 ValueError；参看 launch-parameters.md。
 - **端口冲突（C10）** → `internal_fault_report_port`(22866)/`external_fault_notify_port`(22867)/API `port` 三者必须互异。
+- **未开容错就 kill-rank** → 服务直接崩溃；kill-rank 默认拒绝，`--force` 仅限非容错实验且需显式 `--rank`。
+- **kill-rank 忘带 `--yes`** → 被决策门拒绝并提示目标 rank；补 `--yes` 重跑。
+- **kill-rank 目标进程找不到** → 进程标题可能与默认模式不符：先 `ps -eo pid,args | grep -i enginecore` 看实际标题，再用 `--pattern` 指定（`{rank}` 占位）；多节点时确认 `--ssh` 的节点就是该 rank 所在节点。
+- **probe 非 200 就下结论** → 贴状态码 + body 原文；不可达 ≠ 服务坏，先排查连通性。
 
 ## 参考
 
-- CAT 工具层目录（3 个工具 + 任务信封 + MUST 条款，**契约，工具层 to-be-implemented**）：[references/tool-catalog.md](references/tool-catalog.md)
+- CAT 工具层目录（5 个工具 + 任务信封 + MUST 条款，**契约，工具层 to-be-implemented**）：[references/tool-catalog.md](references/tool-catalog.md)
 - REST 契约 / 状态语义 / 服务端校验 / 源码行号索引：[references/fault-tolerance-api.md](references/fault-tolerance-api.md)
 - 启动入参全表 / 硬约束 / 单机与多节点差异 / 兼容性矩阵：[references/launch-parameters.md](references/launch-parameters.md)
 - 能力判定与 retry/scale_down 完整决策表（Agent 侧纯逻辑）：[references/decision-rules.md](references/decision-rules.md)

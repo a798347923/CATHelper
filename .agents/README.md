@@ -37,6 +37,8 @@
 - **能力① 容错能力探测**：只认 `GET /fault_tolerance/status` 的 HTTP 状态码（`200` = 已启用，`404` = 未启用，不可达 ≠ 未启用）；
 - **能力② 容错启动入参**：给出可直接执行的启动命令，并**先**校验硬约束（恢复超时、TP/EP、冗余专家、兼容性）；
 - **能力③ 故障后恢复指令**：先判容错能力 → 再判 rank 是否全部处于 `paused`/`unhealthy`/`dead` → 是则给指令，否则**提示等待**（`pause` 由框架自动下发，Agent 不代发）；
+- **能力④ 测试请求探测**：向服务发送最小化推理请求，验证推理链路（`PROBE_OK` / `PROBE_FAILED` / `PROBE_UNREACHABLE`）；
+- **能力⑤ 故障注入演练**：`kill-rank` 随机杀死一个 DP rank 触发容错链路（仅测试；未开容错默认拒绝，需 `--yes` 确认；默认走工具层，无工具层时可用 `--ssh` 应急通道）；
 - **防错觉**：`apply` 返回 `200` 只代表框架侧指令执行成功，**不等于**服务已恢复——必须复验 `status`；
 - 架构遵循"**大脑在集群外，手脚在集群内**"：Agent 只与集群内的工具层通信，不直连 NPU 计算节点。
 
@@ -45,17 +47,18 @@
 | 文件 | 作用 |
 | --- | --- |
 | `SKILL.md` | 技能正文（**稳定**：铁律、决策门、安全红线、工作流） |
-| `references/tool-catalog.md` | 三个 CAT 工具的参数/返回/失败模式；工具层任务信封与 MUST 条款 |
+| `references/tool-catalog.md` | 五个 CAT 工具的参数/返回/失败模式；工具层任务信封与 MUST 条款 |
 | `references/fault-tolerance-api.md` | `/fault_tolerance/*` REST 契约、状态语义、服务端校验规则、源码行号索引 |
 | `references/launch-parameters.md` | 容错启动入参全表、硬约束、单机/多节点差异、兼容性矩阵 |
-| `references/decision-rules.md` | 能力判定与 `retry`/`scale_down` 的完整决策表（Agent 侧纯逻辑） |
-| `scripts/eep.py` | 取证与执行脚本：`status` / `apply` / `launch` 子命令（stdlib-only，带 verdict 与退出码） |
+| `references/decision-rules.md` | 能力判定、`retry`/`scale_down` 与 probe/kill-rank 的完整决策表（Agent 侧纯逻辑） |
+| `scripts/eep.py` | 取证与执行脚本：`status` / `apply` / `launch` / `probe` / `kill-rank` 子命令（stdlib-only，带 verdict 与退出码） |
 | `scripts/test_eep.py` | eep.py 回归测试（36 用例，含本地 mock 工具层/模拟 vLLM，stdlib-only） |
 
 ### 触发
 
 直接说需求即可，例如："这个 vllm 服务开了容错吗"、"拉起带容错的 vllm 要传哪些参数"、
-"3 号卡挂了，帮我 scale_down"、"能不能 retry 一下"。
+"3 号卡挂了，帮我 scale_down"、"能不能 retry 一下"、"发个测试请求看看服务还通不通"、
+"kill 一个 rank 演练一下缩容"。
 
 ### 关键约束
 
