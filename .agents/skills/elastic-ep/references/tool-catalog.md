@@ -45,7 +45,7 @@ GET {CAT_TOOL_URL}/api/tasks/{task_id}
 | `FAILED` | 执行失败，`error` 含原因（含执行节点原始输出） |
 | `REJECTED` | 预检/门控拒绝（如 launch 硬约束不满足），`error.code` 说明拒绝项 |
 
-## 2. 三个 CAT 工具
+## 2. 五个 CAT 工具
 
 ### 工具一：`vllm_ft_status` — 容错能力与 rank 状态查询
 
@@ -152,6 +152,61 @@ GET {CAT_TOOL_URL}/api/tasks/{task_id}
 | 硬约束校验不过（见 launch-parameters.md §2） | `REJECTED`，`error.code: "HARD_CONSTRAINT"`，启动前即拒 |
 | 启动失败 | `FAILED`，携带节点原始输出 |
 
+### 工具四：`vllm_probe_request` — 测试推理请求（验证服务可推理）
+
+底层动作：向目标 vLLM API 服务发送最小化推理请求（`POST /v1/chat/completions`），在集群内执行。
+
+**args：**
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `host` | string | ✅ | vLLM API 服务地址 |
+| `port` | int | ✅ | vLLM API 端口 |
+| `model` | string | ❌ | 请求体中的模型名（不传则省略该字段） |
+| `prompt` | string | ❌ | 用户消息内容，默认 `"ping"` |
+| `max_tokens` | int | ❌ | 默认 1 |
+| `timeout_sec` | int | ❌ | HTTP 超时秒数，默认 10 |
+
+**result（SUCCESS）：**
+
+```json
+{"http_status": 200, "elapsed_ms": 123, "body": {"choices": [...]}}
+```
+
+**失败模式：**
+
+| 情形 | 表现 |
+| --- | --- |
+| vLLM 返回非 200 | 仍为 SUCCESS——回传 `http_status` 与 body，由 Agent 判 `PROBE_FAILED` |
+| 连接失败 / 超时 | `FAILED`，`TRANSPORT_ERROR` / `TIMEOUT` |
+
+### 工具五：`vllm_kill_rank` — 杀死指定 DP rank 进程（故障注入，仅测试）
+
+底层动作：在计算节点上定位目标实例的 DP rank 进程（EngineCore / Worker，按实例的进程标识与端口归属定位）并 `SIGKILL`，触发容错框架的故障上报与自动 pause。
+
+**args：**
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `host` | string | ✅ | vLLM API 服务地址（定位目标实例） |
+| `port` | int | ✅ | vLLM API 端口 |
+| `rank` | int | ✅ | 目标 DP rank（Agent 侧已完成随机选择与范围/dead 校验） |
+| `confirmed` | bool | ✅ | Agent 的破坏性操作确认标记，必须为 `true`，否则工具层拒绝 |
+
+**result（SUCCESS）：**
+
+```json
+{"killed_rank": 2, "pid": 12345, "method": "SIGKILL"}
+```
+
+**失败模式：**
+
+| 情形 | 表现 |
+| --- | --- |
+| `confirmed` 缺失/为 false | `REJECTED`，`error.code: "UNCONFIRMED"` |
+| 目标实例容错未启用且未显式 force | `REJECTED`，`error.code: "FT_DISABLED"` |
+| 找不到目标 rank 进程 | `FAILED`，`error.code: "NOT_FOUND"` |
+
 ## 3. MUST 条款（工具层实现必须满足）
 
 | # | 条款 |
@@ -163,9 +218,13 @@ GET {CAT_TOOL_URL}/api/tasks/{task_id}
 | M5 | `vllm_ft_launch` 在提交集群前先在工具层做硬约束校验（`recovery_timeout > max(gloo_timeout, 100)` 等） |
 | M6 | 每个工具支持任务超时（默认 60s，可配），超时置 `FAILED` |
 | M7 | `result`/`error` 必须携带执行节点的**原始输出**（供 Agent 出证据） |
+| M8 | `vllm_kill_rank` 执行前**必须二次校验**目标实例容错已启用；未启用默认拒绝（`FT_DISABLED`），除非任务显式携带 force 标记 |
+| M9 | `vllm_kill_rank` 只允许作用于**目标实例**的 DP rank 进程（按实例的进程标识/端口归属定位），严禁误杀其他服务的进程 |
+| M10 | 破坏性工具（kill）必须携带 Agent 的 `confirmed=true` 确认标记，无确认一律拒绝 |
 
 ## 4. Agent 侧约定
 
-- 选择工具：能力探测 → `vllm_ft_status`；下发恢复指令 → `vllm_ft_apply`；拉起服务 → `vllm_ft_launch`。
+- 选择工具：能力探测 → `vllm_ft_status`；下发恢复指令 → `vllm_ft_apply`；拉起服务 → `vllm_ft_launch`；验证服务可推理 → `vllm_probe_request`；注入故障演练 → `vllm_kill_rank`（目标选择、dead/范围校验与 `--yes` 确认在 **Agent 侧**完成，工具层二次校验并拒绝未确认/未开容错的 kill）。
+- **无工具层的应急通道**：`eep.py kill-rank --ssh [USER@]HOST` 由 Agent 直接 SSH 执行 `pgrep -f 'EngineCore_DP<rank>'` + `kill -9`（状态来源 `--direct`/`--json`）。这是**例外**（违反"手脚在集群内"），仅限独立测试环境并需用户明确同意；有工具层时必须走 `vllm_kill_rank`。
 - 决策门（能力 → rank 状态 → 指令选择）在 **Agent 侧**完成（见 decision-rules.md），工具层只做机械执行。
 - 取证脚本 `scripts/eep.py` 已实现本信封的客户端（提交 + 轮询 + verdict）；工具层未就绪时可用 `--json` 纯本地模式。

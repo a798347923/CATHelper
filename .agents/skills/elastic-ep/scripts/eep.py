@@ -2,10 +2,14 @@
 """Elastic-EP agent-side forensic and execution helper (stdlib-only).
 
 Subcommands:
-  status   Probe fault-tolerance capability and engine status; emit verdict.
-  apply    Gate-check (capability -> rank states -> instruction) then dispatch
-           retry / scale_down.
-  launch   Validate fault-tolerant launch parameters; emit a launch task spec.
+  status     Probe fault-tolerance capability and engine status; emit verdict.
+  apply      Gate-check (capability -> rank states -> instruction) then dispatch
+             retry / scale_down.
+  launch     Validate fault-tolerant launch parameters; emit a launch task spec.
+  probe      Send a minimal inference request to verify the service serves.
+  kill-rank  Kill one DP rank process to trigger fault recovery (testing only;
+             via the CAT tool layer, or --ssh as an escape hatch when no tool
+             layer exists). Never uses --direct for the kill itself.
 
 Transport (choose one, per subcommand):
   --tool-url URL   Submit/poll through the CAT tool-layer task envelope
@@ -30,6 +34,9 @@ See references/decision-rules.md for the decision tables implemented here.
 
 import argparse
 import json
+import random
+import shlex
+import subprocess
 import sys
 import time
 import urllib.error
@@ -193,11 +200,12 @@ def fetch_status(args):
                 '({"total_engines":..., "engines":[...]})',
             )
         return capability, status, None
+    timeout = getattr(args, "timeout", 5.0)
     if args.direct:
         warn("--direct bypasses the tool layer (brain-in-cluster). Debugging only.")
-        return fetch_status_direct(args.host, args.port, args.timeout)
+        return fetch_status_direct(args.host, args.port, timeout)
     if args.tool_url:
-        return fetch_status_tool(args.tool_url, args.host, args.port, args.timeout)
+        return fetch_status_tool(args.tool_url, args.host, args.port, timeout)
     raise EepExit(EXIT_USAGE, "need one of --tool-url / --direct / --json")
 
 
@@ -679,6 +687,303 @@ def cmd_launch(args):
 
 
 # ---------------------------------------------------------------------------
+# probe / kill-rank (test helpers)
+# ---------------------------------------------------------------------------
+
+
+def _first_choice(body):
+    """Extract the first reply text from an OpenAI-style chat response."""
+    if not isinstance(body, dict):
+        return None
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    if not isinstance(first, dict):
+        return None
+    msg = first.get("message")
+    if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+        return msg["content"].strip()
+    text = first.get("text")
+    return text.strip() if isinstance(text, str) else None
+
+
+def cmd_probe(args):
+    if args.json is not None:
+        raise EepExit(EXIT_USAGE, "probe does not support --json (needs a live service)")
+    payload = {
+        "messages": [{"role": "user", "content": args.prompt}],
+        "max_tokens": args.max_tokens,
+    }
+    if args.model:
+        payload["model"] = args.model
+
+    if args.direct:
+        warn("--direct bypasses the tool layer (brain-in-cluster). Debugging only.")
+        url = "http://%s:%s/v1/chat/completions" % (args.host, args.port)
+        start = time.monotonic()
+        try:
+            status, raw, body = http_json(url, "POST", payload, timeout=args.timeout)
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            print("PROBE_UNREACHABLE | POST %s -> %s" % (url, e))
+            return EXIT_UNKNOWN
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        if status == 200:
+            text = _first_choice(body)
+            print(
+                "PROBE_OK | POST /v1/chat/completions -> 200 in %sms%s"
+                % (elapsed_ms, (" | reply: %s" % text if text else ""))
+            )
+            return EXIT_OK
+        print("PROBE_FAILED | POST /v1/chat/completions -> HTTP %s %s" % (status, raw))
+        return EXIT_EXEC_FAILED
+
+    if args.tool_url:
+        task = run_task(
+            args.tool_url,
+            "vllm_probe_request",
+            {
+                "host": args.host,
+                "port": args.port,
+                "model": args.model,
+                "prompt": args.prompt,
+                "max_tokens": args.max_tokens,
+                "timeout_sec": args.timeout,
+            },
+            task_timeout=args.task_timeout,
+        )
+        state = task.get("state")
+        if state == "SUCCESS":
+            result = task.get("result") or {}
+            http_status = result.get("http_status")
+            elapsed_ms = result.get("elapsed_ms")
+            body = result.get("body")
+            if http_status == 200:
+                text = _first_choice(body)
+                print(
+                    "PROBE_OK | vllm_probe_request -> 200 in %sms%s"
+                    % (elapsed_ms or "?", (" | reply: %s" % text if text else ""))
+                )
+                return EXIT_OK
+            print(
+                "PROBE_FAILED | vllm_probe_request -> HTTP %s %s"
+                % (http_status, json.dumps(body, ensure_ascii=False))
+            )
+            return EXIT_EXEC_FAILED
+        if state == "FAILED":
+            err = task.get("error") or {}
+            if err.get("code") in ("TRANSPORT_ERROR", "TIMEOUT"):
+                print("PROBE_UNREACHABLE | tool reports vLLM unreachable: %s" % err.get("message"))
+                return EXIT_UNKNOWN
+            raise EepExit(
+                EXIT_EXEC_FAILED, "tool vllm_probe_request FAILED: %s" % json.dumps(task)
+            )
+        raise EepExit(EXIT_GATE, "tool vllm_probe_request REJECTED: %s" % json.dumps(task))
+
+    raise EepExit(EXIT_USAGE, "need one of --tool-url / --direct")
+
+
+def _kill_hint(rank):
+    print(
+        "  hint: the fault-tolerance framework will auto-pause the surviving "
+        "ranks; then use status to wait and apply scale_down "
+        "--exclude-dp-ranks %s to drill scale-down recovery" % rank
+    )
+
+
+def _ssh_kill(args, rank):
+    """Kill one DP rank process over SSH (escape hatch when no tool layer)."""
+    pattern = args.pattern or "EngineCore_DP{rank}([[:space:]]|$)"
+    try:
+        pat = pattern.format(rank=rank)
+    except (KeyError, IndexError, ValueError):
+        raise EepExit(EXIT_USAGE, "--pattern supports only the {rank} placeholder")
+
+    remote = (
+        "pids=$(pgrep -f %s || true); "
+        'if [ -z "$pids" ]; then echo "__EEP_NOT_FOUND__"; '
+        "ps -eo pid,args | grep -i enginecore | grep -v grep; exit 3; fi; "
+        'echo "__EEP_PIDS__ $pids"; kill -9 $pids && echo "__EEP_KILLED__"'
+        % shlex.quote(pat)
+    )
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    if args.ssh_port:
+        cmd += ["-p", str(args.ssh_port)]
+    if args.ssh_key:
+        cmd += ["-i", args.ssh_key]
+    cmd += [args.ssh, remote]
+
+    print("  ssh cmd: ssh %s %s" % (args.ssh, remote))
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=args.task_timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print("KILL_FAILED | ssh %s -> %s" % (args.ssh, e))
+        return EXIT_TRANSPORT
+
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if "__EEP_KILLED__" in out:
+        pids = ""
+        for line in out.splitlines():
+            if line.startswith("__EEP_PIDS__"):
+                parts = line.split(None, 1)
+                pids = parts[1] if len(parts) > 1 else ""
+        print(
+            "KILLED | rank=%s pid=%s (ssh %s, pattern %r)"
+            % (rank, pids, args.ssh, pat)
+        )
+        _kill_hint(rank)
+        return EXIT_OK
+    if "__EEP_NOT_FOUND__" in out:
+        print("KILL_NOT_FOUND | no process matched %r on %s" % (pat, args.ssh))
+        if out:
+            print("  candidates: %s" % out.replace("\n", " | "))
+        if err:
+            print("  stderr: %s" % err.replace("\n", " | "))
+        print("  hint: check the process title (ps -eo pid,args | grep -i enginecore) and pass --pattern")
+        return EXIT_EXEC_FAILED
+    print("KILL_FAILED | ssh %s rc=%s" % (args.ssh, proc.returncode))
+    if out:
+        print("  stdout: %s" % out.replace("\n", " | "))
+    if err:
+        print("  stderr: %s" % err.replace("\n", " | "))
+    return EXIT_EXEC_FAILED
+
+
+def cmd_kill_rank(args):
+    if args.ssh:
+        if args.tool_url:
+            raise EepExit(EXIT_USAGE, "use either --tool-url or --ssh, not both")
+        if not args.direct and args.json is None:
+            raise EepExit(
+                EXIT_USAGE,
+                "kill-rank --ssh needs a status source: --direct (query the API) "
+                "or --json FILE",
+            )
+        if not args.ssh.strip():
+            raise EepExit(EXIT_USAGE, "--ssh target must not be empty")
+        warn(
+            "--ssh bypasses the tool layer (the agent reaches the compute node "
+            "directly). Emergency/testing use only."
+        )
+    else:
+        if args.json is not None:
+            raise EepExit(
+                EXIT_USAGE,
+                "kill-rank needs a live service (no --json) unless --ssh is used",
+            )
+        if args.direct:
+            raise EepExit(
+                EXIT_USAGE,
+                "kill-rank requires the tool layer (--tool-url) or --ssh: the agent "
+                "must not run the kill itself without one of them",
+            )
+        if not args.tool_url:
+            raise EepExit(EXIT_USAGE, "need --tool-url or --ssh")
+
+    capability, status, evidence = fetch_status(args)
+    if capability == "unknown":
+        print("REJECTED | vLLM unreachable; cannot verify ranks to kill")
+        if evidence:
+            print("  evidence: %s" % evidence)
+        return EXIT_UNKNOWN
+    if capability not in ("enabled", "disabled"):
+        print("REJECTED | unexpected capability value %r" % capability)
+        return EXIT_UNKNOWN
+
+    if capability == "disabled":
+        if not args.force:
+            print(
+                "REJECTED | fault tolerance not enabled; killing a rank would crash "
+                "the instance -- use --force only for non-FT experiments"
+            )
+            return EXIT_DISABLED
+        if args.rank is None:
+            print(
+                "REJECTED | FT disabled: random target selection needs a status; "
+                "specify --rank explicitly"
+            )
+            return EXIT_GATE
+        target = args.rank
+    else:
+        problems = status_problems(status)
+        if problems:
+            print("REJECTED | status data inconsistent: %s" % "; ".join(problems))
+            return EXIT_GATE
+        total, _, _ = analyze(status)
+        if total < 1:
+            print("REJECTED | 0 engines; nothing to kill")
+            return EXIT_GATE
+        dead = [
+            e.get("id")
+            for e in status.get("engines", [])
+            if e.get("status") == "dead"
+        ]
+        if args.rank is not None:
+            if args.rank < 0 or args.rank >= total:
+                print(
+                    "REJECTED | rank %s out of range [0, %s) -- use the latest status"
+                    % (args.rank, total)
+                )
+                return EXIT_GATE
+            if args.rank in dead:
+                print("REJECTED | rank %s is already dead; nothing to kill" % args.rank)
+                return EXIT_GATE
+            target = args.rank
+        else:
+            alive = [i for i in range(total) if i not in dead]
+            if not alive:
+                print("REJECTED | all %s ranks are dead; nothing to kill" % total)
+                return EXIT_GATE
+            target = random.choice(alive)
+
+    if not args.yes:
+        print(
+            "REJECTED | destructive action needs confirmation -- re-run with --yes "
+            "(target rank=%s)" % target
+        )
+        return EXIT_GATE
+
+    if args.ssh:
+        return _ssh_kill(args, target)
+
+    task = run_task(
+        args.tool_url,
+        "vllm_kill_rank",
+        {"host": args.host, "port": args.port, "rank": target, "confirmed": True},
+        task_timeout=args.task_timeout,
+    )
+    state = task.get("state")
+    if state == "SUCCESS":
+        result = task.get("result") or {}
+        print(
+            "KILLED | rank=%s pid=%s (%s)"
+            % (result.get("killed_rank"), result.get("pid"), result.get("method", "SIGKILL"))
+        )
+        _kill_hint(target)
+        return EXIT_OK
+    if state == "FAILED":
+        err = task.get("error") or {}
+        if err.get("code") in ("TRANSPORT_ERROR", "TIMEOUT"):
+            raise EepExit(
+                EXIT_TRANSPORT,
+                "tool reports vLLM unreachable: %s" % err.get("message"),
+            )
+        raise EepExit(
+            EXIT_EXEC_FAILED, "tool vllm_kill_rank FAILED: %s" % json.dumps(task)
+        )
+    print("KILL_REJECTED | %s" % json.dumps(task.get("error"), ensure_ascii=False))
+    return EXIT_GATE
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -758,6 +1063,40 @@ def build_parser():
     p.add_argument("--num-nodes", type=int, default=1, help="total node count (default: 1)")
     p.add_argument("--extra-args", default=None, help="extra vLLM args as a JSON object")
     p.add_argument("--task-timeout", type=float, default=60.0, help="tool-layer task timeout seconds (default: 60)")
+
+    p = sub.add_parser("probe", help="send a minimal inference request to verify the service serves")
+    _common(p)
+    p.add_argument("--host", default="localhost", help="vLLM API host (default: localhost)")
+    p.add_argument("--port", type=int, default=8006, help="vLLM API port (default: 8006)")
+    p.add_argument("--model", default=None, help="model name to include in the request (optional)")
+    p.add_argument("--prompt", default="ping", help="user message content (default: ping)")
+    p.add_argument("--max-tokens", type=int, default=1, help="max_tokens (default: 1)")
+    p.add_argument("--timeout", type=float, default=10.0, help="HTTP timeout seconds (default: 10)")
+    p.add_argument("--task-timeout", type=float, default=60.0, help="tool-layer task timeout seconds (default: 60)")
+
+    p = sub.add_parser("kill-rank", help="kill one DP rank process to trigger fault recovery (testing only)")
+    _common(p)
+    p.add_argument("--host", default="localhost", help="vLLM API host (default: localhost)")
+    p.add_argument("--port", type=int, default=8006, help="vLLM API port (default: 8006)")
+    p.add_argument("--rank", type=int, default=None, help="specific DP rank to kill (default: random non-dead rank)")
+    p.add_argument("--yes", action="store_true", help="confirm the destructive action")
+    p.add_argument("--force", action="store_true", help="allow killing when fault tolerance is disabled (the instance will crash)")
+    p.add_argument(
+        "--ssh",
+        default=None,
+        metavar="USER@HOST",
+        help="kill over SSH instead of the tool layer (escape hatch; requires a status source: --direct or --json)",
+    )
+    p.add_argument("--ssh-port", type=int, default=None, help="SSH port (default: 22)")
+    p.add_argument("--ssh-key", default=None, help="SSH identity file")
+    p.add_argument(
+        "--pattern",
+        default=None,
+        metavar="REGEX",
+        help="remote pgrep -f pattern with a {rank} placeholder "
+        "(default: 'EngineCore_DP{rank}([[:space:]]|$)')",
+    )
+    p.add_argument("--task-timeout", type=float, default=60.0, help="tool-layer/ssh timeout seconds (default: 60)")
     return parser
 
 
@@ -773,6 +1112,10 @@ def main(argv=None):
         code = cmd_apply(args)
     elif args.command == "launch":
         code = cmd_launch(args)
+    elif args.command == "probe":
+        code = cmd_probe(args)
+    elif args.command == "kill-rank":
+        code = cmd_kill_rank(args)
     else:
         parser.error("unknown command %r" % args.command)
     sys.exit(code)

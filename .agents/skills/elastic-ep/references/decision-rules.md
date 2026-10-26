@@ -103,10 +103,36 @@
 
 | 退出码 | 含义 |
 | --- | --- |
-| 0 | 正向裁决：`FT_ENABLED` / `SENT` / launch 校验通过 |
+| 0 | 正向裁决：`FT_ENABLED` / `SENT` / launch 校验通过 / `PROBE_OK` / `KILLED` |
 | 1 | 传输/工具层/数据异常错误（含 `STATUS_MISSING`、`STATUS_INCONSISTENT`） |
 | 2 | 用法错误（参数缺失/非法） |
-| 3 | 决策门拒绝（前置条件不满足：有 healthy、dead+retry、0 engines、exclude 越界、数据不一致、硬约束不过） |
+| 3 | 决策门拒绝（前置条件不满足：有 healthy、dead+retry、0 engines、exclude 越界、数据不一致、硬约束不过、kill 未确认/目标不可杀） |
 | 4 | 能力不存在（404，`FT_DISABLED`） |
-| 5 | 状态未知（不可达，`FT_UNKNOWN`） |
-| 6 | 服务端指令执行失败（apply 非 200） |
+| 5 | 状态未知（不可达，`FT_UNKNOWN`、`PROBE_UNREACHABLE`） |
+| 6 | 服务端指令执行失败（apply 非 200、`PROBE_FAILED`、kill 执行失败） |
+
+## 9. 测试辅助（probe / kill-rank）
+
+### 9.1 probe 裁决（验证服务可推理）
+
+| 证据 | 裁决 | 退出码 |
+| --- | --- | --- |
+| `POST /v1/chat/completions` → 200（含 choices） | `PROBE_OK`（附回复文本与耗时） | 0 |
+| 非 200 | `PROBE_FAILED`（附状态码与 body 原文） | 6 |
+| 连接失败/超时 | `PROBE_UNREACHABLE`（不可达 ≠ 服务坏，先排查连通性） | 5 |
+
+> 用法：`retry`/`scale_down` 复验 healthy 后，用 probe 确认**推理请求真的通了**——这是"已恢复"的最强证据。
+
+### 9.2 kill-rank 决策门（故障注入演练，顺序固定）
+
+| # | 条件 | 结论 |
+| --- | --- | --- |
+| K1 | 传输：工具层（`--tool-url`，默认）或 SSH 应急通道（`--ssh`，需状态源 `--direct`/`--json`）；两者互斥；都没有 → 拒绝 | 无传输不得杀进程；SSH 是**例外**（Agent 直连节点，需用户同意），且状态仍要经 `--direct`/`--json` 读取 |
+| K2 | `FT_DISABLED` 且无 `--force` | 拒绝：杀 rank 会直接崩掉整个实例；`--force` 仅限非容错实验，且必须显式 `--rank` |
+| K3 | 状态未知/数据不一致/0 engines | 拒绝：无法核实目标 |
+| K4 | 指定 `--rank` 越界或已 dead | 拒绝：目标不可杀 |
+| K5 | 随机目标但全部 rank 已 dead | 拒绝：无活口可杀 |
+| K6 | 无 `--yes` | 拒绝：破坏性操作需确认（提示目标 rank，重跑带 `--yes`） |
+| K7 | 全部通过 | 工具层：`vllm_kill_rank`（`confirmed=true`，工具层二次校验 M8–M10）；SSH：远程 `pgrep -f 'EngineCore_DP{rank}([[:space:]]\|$)'` + `kill -9`（`--pattern` 可覆盖；找不到时输出 `ps` 候选） |
+
+**kill 之后的预期链路**：被杀 rank 上报故障 → 框架自动 `pause` 存活 rank → `status` 观察（被杀 rank `dead`、其余 `paused`/`unhealthy`）→ `apply scale_down --exclude-dp-ranks <被杀rank>` 演练缩容 → 复验 healthy + probe。
